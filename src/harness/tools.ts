@@ -7,12 +7,14 @@ import type {
   Evidence,
   EvidenceType,
   Knowledge,
+  KnowledgeOrigin,
   KnowledgeStatus,
   KnowledgeType,
 } from "../knowledge/types.js";
 
 const KNOWLEDGE_TYPES = ["fact", "decision", "lesson"] as const;
 const KNOWLEDGE_STATUSES = ["candidate", "verified", "superseded", "archived"] as const;
+const KNOWLEDGE_ORIGINS = ["explicit", "automatic"] as const;
 const EVIDENCE_TYPES = ["session", "file", "git"] as const;
 const DEFAULT_TOOL_RESULT_LIMIT = 10;
 const MAX_TOOL_RESULT_LIMIT = 20;
@@ -55,6 +57,7 @@ const knowledgeSummarySchema = {
     project: { type: "string" },
     projectTruncated: { type: "boolean" },
     status: { type: "string", enum: KNOWLEDGE_STATUSES, required: true },
+    creationOrigin: { type: "string", enum: KNOWLEDGE_ORIGINS, required: true },
     evidence: { type: "array", items: evidenceSummarySchema },
   },
 } as const;
@@ -346,6 +349,11 @@ export function registerKnowledgeTools(
       },
       type: { type: "string", enum: KNOWLEDGE_TYPES, description: "Optional knowledge category." },
       status: { type: "string", enum: KNOWLEDGE_STATUSES, description: "Optional lifecycle status." },
+      creationOrigin: {
+        type: "string",
+        enum: KNOWLEDGE_ORIGINS,
+        description: "Optional origin filter; automatic extraction results are candidates.",
+      },
       limit: { type: "integer", description: "Maximum results, capped at 20 (default 10)." },
     },
     output: {
@@ -370,6 +378,9 @@ export function registerKnowledgeTools(
         project,
         ...(args.type === undefined ? {} : { type: args.type as KnowledgeType }),
         ...(args.status === undefined ? {} : { status: args.status as KnowledgeStatus }),
+        ...(args.creationOrigin === undefined
+          ? {}
+          : { creationOrigin: args.creationOrigin as KnowledgeOrigin }),
         limit: boundedLimit(args.limit),
       };
       const items = repository.search(args.query, options);
@@ -383,7 +394,7 @@ export function registerKnowledgeTools(
 
   const listTool = defineTool({
     name: "knowledge_list",
-    description: "List project knowledge with optional workspace, project, type, and status filters.",
+    description: "List project knowledge with optional workspace, project, type, status, and creation-origin filters.",
     parameters: {
       workspace: { type: "string", description: "Workspace filter; defaults to the active session cwd." },
       project: {
@@ -392,6 +403,11 @@ export function registerKnowledgeTools(
       },
       type: { type: "string", enum: KNOWLEDGE_TYPES, description: "Optional knowledge category." },
       status: { type: "string", enum: KNOWLEDGE_STATUSES, description: "Optional lifecycle status." },
+      creationOrigin: {
+        type: "string",
+        enum: KNOWLEDGE_ORIGINS,
+        description: "Optional origin filter; automatic extraction results are candidates.",
+      },
       limit: { type: "integer", description: "Maximum results, capped at 20 (default 10)." },
     },
     output: {
@@ -415,6 +431,9 @@ export function registerKnowledgeTools(
         project,
         ...(args.type === undefined ? {} : { type: args.type as KnowledgeType }),
         ...(args.status === undefined ? {} : { status: args.status as KnowledgeStatus }),
+        ...(args.creationOrigin === undefined
+          ? {}
+          : { creationOrigin: args.creationOrigin as KnowledgeOrigin }),
         limit: boundedLimit(args.limit),
       };
       const items = repository.list(options);
@@ -633,6 +652,7 @@ function summarize(
     contentTruncated: item.content.length > contentLimit,
     workspace: item.scope.workspace.slice(0, MAX_WORKSPACE_CHARS),
     status: item.status,
+    creationOrigin: item.creationOrigin,
   };
   if (item.scope.workspace.length > MAX_WORKSPACE_CHARS) {
     summary.workspaceTruncated = true;

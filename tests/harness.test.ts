@@ -11,11 +11,12 @@ import {
   type ToolRunContext,
 } from "@deepseek-ai/dsh-tools";
 import type { Session, SessionEvent } from "@deepseek-ai/dsh-session";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { KnowledgeRepository } from "../src/knowledge/repository.js";
 import { KnowledgeStore } from "../src/knowledge/store.js";
 import type { Knowledge, KnowledgeType } from "../src/knowledge/types.js";
 import { KnowledgeInjectionTracker, KNOWLEDGE_CONTEXT_SOURCE } from "../src/harness/events.js";
+import { observeKnowledgeExtraction } from "../src/harness/extraction.js";
 import {
   createKnowledgePreStepHandler,
   MAX_INJECTED_CONTEXT_CHARS,
@@ -39,6 +40,7 @@ type PluginHarness = {
 
 const activeHarnesses: PluginHarness[] = [];
 const activeStores: KnowledgeStore[] = [];
+const extractionEventTime = Date.parse("2026-10-02T12:00:00.000Z");
 
 afterEach(async () => {
   const harnesses = activeHarnesses.splice(0);
@@ -69,6 +71,165 @@ describe("DeepSeek Harness plugin adapters", () => {
     expect(harness.listeners.has("agent/pre-step")).toBe(true);
   });
 
+  it("keeps automatic extraction off by default", async () => {
+    const harness = createPluginHarness();
+    const session = makeSession("C:\\workspace\\payments");
+    emitTurn(harness, session, 1, "We decided to use PostgreSQL for the project database.");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(openRepository(harness.path).list({ workspace: "C:\\workspace\\payments" })).toEqual([]);
+  });
+
+  it("rejects secret-bearing automatic candidates without storing or logging their content", async () => {
+    const harness = createPluginHarness({ automaticExtraction: true });
+    const session = makeSession("C:\\workspace");
+    const secretText = "We decided to use PostgreSQL; password=hunter2 for the project database.";
+    emitTurn(harness, session, 1, secretText);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(openRepository(harness.path).list({ workspace: "C:\\workspace" })).toEqual([]);
+    expect(harness.warnings.join(" ")).not.toContain("hunter2");
+    expect(harness.warnings.join(" ")).not.toContain(secretText);
+  });
+
+  it("extracts only direct user statements with current scope and bounded session evidence", async () => {
+    const harness = createPluginHarness({ automaticExtraction: true, project: "payments" });
+    const session = makeSession("C:\\workspace\\payments");
+    const dispatch = harness.listeners.get("session/event")! as (session: Session, event: SessionEvent) => void;
+    dispatch(session, turnStartEvent(1, 10));
+    dispatch(session, userMessageEvent(
+      "We decided to use PostgreSQL for the project database. The remaining text is not part of the claim.",
+      11,
+      "user",
+    ));
+    dispatch(session, turnEndEvent(1, 12));
+    dispatch(session, turnStartEvent(2, 13));
+    dispatch(session, userMessageEvent(
+      "Backend authentication is implemented using Supabase RLS.",
+      14,
+      "user-approval",
+    ));
+    dispatch(session, turnEndEvent(2, 15));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const repository = openRepository(harness.path);
+    const items = repository.list({
+      workspace: "C:\\workspace\\payments",
+      project: "payments",
+      creationOrigin: "automatic",
+    });
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      type: "decision",
+      content: "We decided to use PostgreSQL for the project database.",
+      status: "candidate",
+      creationOrigin: "automatic",
+      scope: { workspace: "C:\\workspace\\payments", project: "payments" },
+      evidence: [{ type: "session", source: "session-1", locator: "seq=11" }],
+    });
+    expect(items[0]?.evidence[0]?.timestamp).toBe(new Date(extractionEventTime).toISOString());
+
+    const listed = await harness.invoke("knowledge_list", {
+      workspace: "C:\\workspace\\payments",
+      project: "payments",
+      creationOrigin: "automatic",
+    }) as ToolListResult;
+    expect(listed.items[0]?.creationOrigin).toBe("automatic");
+  });
+
+  it("does not retain queued extraction work after session disposal", async () => {
+    const harness = createPluginHarness({ automaticExtraction: true });
+    const session = makeSession("C:\\workspace");
+    const eventListener = harness.listeners.get("session/event")! as (session: Session, event: SessionEvent) => void;
+    eventListener(session, turnStartEvent(1, 1));
+    eventListener(session, userMessageEvent("We decided to use PostgreSQL for the project database.", 2));
+    eventListener(session, turnEndEvent(1, 3));
+    const disposedListener = harness.listeners.get("session/disposed")! as (session: Session) => void;
+    disposedListener(session);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(openRepository(harness.path).list({ workspace: "C:\\workspace" })).toEqual([]);
+  });
+
+  it("bounds user-message text before queuing extraction", async () => {
+    const harness = createPluginHarness({ automaticExtraction: true });
+    const session = makeSession("C:\\workspace");
+    const dispatch = harness.listeners.get("session/event")! as (session: Session, event: SessionEvent) => void;
+    emitTurn(harness, session, 1, `We decided to use PostgreSQL for the project database. ${"x".repeat(1_300)}`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(openRepository(harness.path).list({ workspace: "C:\\workspace" })).toEqual([]);
+  });
+
+  it("enqueues at most one job for a session turn", async () => {
+    const harness = createPluginHarness({ automaticExtraction: true });
+    const session = makeSession("C:\\workspace");
+    const dispatch = harness.listeners.get("session/event")! as (session: Session, event: SessionEvent) => void;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      dispatch(session, turnStartEvent(1, attempt * 3));
+      dispatch(session, userMessageEvent("We decided to use PostgreSQL for the project database.", attempt * 3 + 1));
+      dispatch(session, turnEndEvent(1, attempt * 3 + 2));
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(openRepository(harness.path).list({ workspace: "C:\\workspace" })).toHaveLength(1);
+  });
+
+  it("keeps automatic candidates out of pre-step context until verified", async () => {
+    const harness = createPluginHarness({ project: "payments" });
+    const repository = openRepository(harness.path);
+    const candidate = repository.create({
+      type: "decision",
+      content: "ResponseRouter fallback policy is stable for payment providers.",
+      scope: { workspace: "C:\\workspace\\payments", project: "payments" },
+      creationOrigin: "automatic",
+    });
+    const session = makeSession("C:\\workspace\\payments");
+
+    const excluded = await runPreStep(harness, session, "ResponseRouter fallback policy");
+    expect(excluded.messages).toHaveLength(1);
+    repository.update(candidate.id, { status: "verified" });
+    const verified = await runPreStep(harness, session, "ResponseRouter fallback policy");
+    expect(verified.messages).toHaveLength(2);
+  });
+
+  it("continues agent flow when automatic extraction storage fails and logs no content", async () => {
+    const eventListeners: Array<(session: Session, event: SessionEvent) => void> = [];
+    const disposedListeners: Array<(session: Session) => void> = [];
+    const context = {
+      on(event: string, callback: (...args: never[]) => unknown) {
+        if (event === "session/event") {
+          eventListeners.push(callback as (session: Session, event: SessionEvent) => void);
+        } else if (event === "session/disposed") {
+          disposedListeners.push(callback as (session: Session) => void);
+        }
+        return () => undefined;
+      },
+    } as unknown as Context;
+    const repository = { list: () => { throw new Error("private raw input"); } } as unknown as KnowledgeRepository;
+    const onFailure = vi.fn();
+    const adapter = observeKnowledgeExtraction(context, { getRepository: () => repository, onFailure });
+    const session = makeSession("C:\\workspace");
+    const run = () => {
+      for (const event of [
+        turnStartEvent(1, 1),
+        userMessageEvent("We decided to use PostgreSQL for the project database.", 2),
+        turnEndEvent(1, 3),
+      ]) {
+        for (const listener of eventListeners) {
+          listener(session, event);
+        }
+      }
+    };
+
+    expect(run).not.toThrow();
+    await adapter.whenIdle();
+    expect(onFailure).toHaveBeenCalledOnce();
+    expect(onFailure).not.toHaveBeenCalledWith(expect.stringContaining("private raw input"));
+    await adapter.dispose();
+    expect(disposedListeners).toHaveLength(1);
+  });
+
   it("registers tools and the pre-step hook through real Cordis and disposes them on unload", async () => {
     const directory = mkdtempSync(join(tmpdir(), "dsh-knowledge-cordis-"));
     const path = join(directory, "knowledge.sqlite");
@@ -80,7 +241,11 @@ describe("DeepSeek Harness plugin adapters", () => {
     let fiber: { dispose: () => Promise<void> } | undefined;
     let store: KnowledgeStore | undefined;
     try {
-      fiber = context.plugin(plugin, { databasePath: path, project: "payments" });
+      fiber = context.plugin(plugin, {
+        databasePath: path,
+        project: "payments",
+        automaticExtraction: true,
+      });
       await fiber;
       expect(context.tools.get("knowledge_add")).toBeDefined();
 
@@ -128,9 +293,20 @@ describe("DeepSeek Harness plugin adapters", () => {
         expect(deduplicated.messages).toHaveLength(1);
       }
 
+      context.events.emit("session/event", session, turnStartEvent(2, 20));
+      context.events.emit("session/event", session, userMessageEvent(
+        "We decided to use PostgreSQL for the project database.",
+        21,
+      ));
+      context.events.emit("session/event", session, turnEndEvent(2, 22));
       await fiber.dispose();
       fiber = undefined;
       expect(context.tools.get("knowledge_add")).toBeUndefined();
+      expect(store === undefined ? [] : new KnowledgeRepository(store).list({
+        workspace: "C:\\workspace\\payments",
+        project: "payments",
+        creationOrigin: "automatic",
+      })).toEqual([]);
       await expect(context.events.waterfall(
         "agent/pre-step",
         payload,
@@ -157,6 +333,7 @@ describe("DeepSeek Harness plugin adapters", () => {
 
     expect(result.ok).toBe(true);
     expect(result.item?.status).toBe("candidate");
+    expect(result.item?.creationOrigin).toBe("explicit");
     expect(result.item?.id).toEqual(expect.any(String));
     expect(result.item?.evidence).toEqual(undefined);
 
@@ -806,6 +983,7 @@ type ToolSummary = {
   type: KnowledgeType;
   content: string;
   status: Knowledge["status"];
+  creationOrigin: Knowledge["creationOrigin"];
   evidence?: Array<{ type: string; source: string; locator?: string }>;
 };
 
@@ -836,6 +1014,7 @@ function createPluginHarness(
   const listeners = new Map<string, Listener>();
   const warnings: string[] = [];
   const effects: Array<() => void | Promise<void>> = [];
+  const listenerRecords = new Map<string, Array<{ callback: Listener; active: boolean }>>();
   const pluginContext = {
     tools: {
       register(definition: ToolDefinition): () => void {
@@ -844,10 +1023,32 @@ function createPluginHarness(
       },
     },
     on(event: string, callback: Listener): () => void {
-      listeners.set(event, callback);
-      return () => listeners.delete(event);
+      const record = { callback, active: true };
+      const records = listenerRecords.get(event) ?? [];
+      records.push(record);
+      listenerRecords.set(event, records);
+      listeners.set(event, ((...args: never[]) => {
+        let result: unknown;
+        for (const listener of [...records]) {
+          if (listener.active) {
+            const current = listener.callback(...args);
+            if (current !== undefined) {
+              result = current;
+            }
+          }
+        }
+        return result;
+      }) as Listener);
+      return () => {
+        record.active = false;
+        const remaining = records.filter((listener) => listener.active);
+        if (remaining.length === 0) {
+          listenerRecords.delete(event);
+          listeners.delete(event);
+        }
+      };
     },
-    effect(effect: () => () => void, _label?: string): () => Promise<void> {
+    effect(effect: () => () => void | Promise<void>, _label?: string): () => Promise<void> {
       const dispose = effect();
       effects.push(dispose);
       return async () => dispose();
@@ -900,6 +1101,51 @@ function makeSession(cwd: string | undefined, messages: ReturnType<typeof create
     deriveMessages: () => session.messages,
   };
   return session as unknown as Session & { messages: ReturnType<typeof createUserMessage>[] };
+}
+
+function emitTurn(
+  harness: PluginHarness,
+  session: Session,
+  turn: number,
+  text: string,
+  sourceKind = "user",
+): void {
+  const listener = harness.listeners.get("session/event")! as (session: Session, event: SessionEvent) => void;
+  listener(session, turnStartEvent(turn, turn * 3));
+  listener(session, userMessageEvent(text, turn * 3 + 1, sourceKind));
+  listener(session, turnEndEvent(turn, turn * 3 + 2));
+}
+
+function turnStartEvent(turn: number, sequence: number): SessionEvent {
+  return {
+    type: "turn/start",
+    seq: sequence as SessionEvent<"turn/start">["seq"],
+    time: extractionEventTime,
+    data: { turn },
+  };
+}
+
+function turnEndEvent(turn: number, sequence: number): SessionEvent {
+  return {
+    type: "turn/end",
+    seq: sequence as SessionEvent<"turn/end">["seq"],
+    time: extractionEventTime,
+    data: { turn, reason: { kind: "completed" } },
+  };
+}
+
+function userMessageEvent(text: string, sequence: number, sourceKind = "user"): SessionEvent {
+  const data = createUserMessage({
+    content: [{ type: "text", text }],
+    source: { kind: sourceKind } as never,
+  });
+  return {
+    type: "user/message",
+    seq: sequence as SessionEvent<"user/message">["seq"],
+    time: extractionEventTime,
+    data,
+    surfaceOp: "append",
+  };
 }
 
 function makeToolExecution(

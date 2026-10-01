@@ -39,7 +39,7 @@ const legacySchema = `
   CREATE INDEX knowledge_updated_at_idx ON knowledge(updated_at);
 `;
 
-describe("SQLite schema v1 to v2 migration", () => {
+describe("SQLite schema migrations", () => {
   let directory: string | undefined;
   let store: KnowledgeStore | undefined;
 
@@ -84,6 +84,7 @@ describe("SQLite schema v1 to v2 migration", () => {
       content: "Use transactions for storage.",
       scope: { workspace: "workspace-a", project: "project-a" },
       status: "verified",
+      creationOrigin: "explicit",
       evidence: [
         {
           type: "file",
@@ -100,7 +101,7 @@ describe("SQLite schema v1 to v2 migration", () => {
       createdAt: "2025-01-01T00:00:00.000Z",
       updatedAt: "2025-01-02T00:00:00.000Z",
     });
-    expect(store.database.pragma("user_version", { simple: true })).toBe(2);
+    expect(store.database.pragma("user_version", { simple: true })).toBe(3);
     expect(store.database.prepare("PRAGMA foreign_key_list(knowledge_evidence)").all()).toHaveLength(1);
     expect((store.database.prepare("PRAGMA index_list(knowledge)").all() as Array<{ name: string }>)
       .map(({ name }) => name)).toEqual(expect.arrayContaining([
@@ -166,5 +167,56 @@ describe("SQLite schema v1 to v2 migration", () => {
     } finally {
       reopened.close();
     }
+  });
+
+  it("migrates a schema v2 database without changing knowledge or provenance", () => {
+    directory = mkdtempSync(join(tmpdir(), "dsh-knowledge-v2-migration-"));
+    const path = join(directory, "knowledge.sqlite");
+    const legacy = new Database(path);
+    legacy.pragma("foreign_keys = ON");
+    legacy.exec(legacySchema);
+    legacy.exec("ALTER TABLE knowledge_evidence ADD COLUMN git_commit TEXT;");
+    legacy.exec("ALTER TABLE knowledge_evidence ADD COLUMN git_path TEXT;");
+    legacy.pragma("user_version = 2");
+    legacy.prepare(`
+      INSERT INTO knowledge
+        (id, type, content, workspace, project, status, replacement_id, created_at, updated_at)
+      VALUES ('v2-item', 'lesson', 'Use bounded startup waits.', 'workspace-v2', 'api', 'candidate', NULL, '2025-02-01T00:00:00.000Z', '2025-02-01T00:00:00.000Z')
+    `).run();
+    legacy.prepare(`
+      INSERT INTO knowledge_evidence
+        (knowledge_id, ordinal, type, source, locator, timestamp, git_commit, git_path)
+      VALUES ('v2-item', 0, 'file', 'src/startup.ts', 'initialize', '2025-02-01T00:00:00.000Z', ?, ?)
+    `).run("a".repeat(40), "src/startup.ts");
+    legacy.close();
+
+    store = new KnowledgeStore(path);
+    const repository = new KnowledgeRepository(store);
+    expect(repository.getById("v2-item")).toEqual({
+      id: "v2-item",
+      type: "lesson",
+      content: "Use bounded startup waits.",
+      scope: { workspace: "workspace-v2", project: "api" },
+      status: "candidate",
+      creationOrigin: "explicit",
+      evidence: [{
+        type: "file",
+        source: "src/startup.ts",
+        locator: "initialize",
+        timestamp: "2025-02-01T00:00:00.000Z",
+        gitProvenance: { commit: "a".repeat(40), path: "src/startup.ts" },
+      }],
+      createdAt: "2025-02-01T00:00:00.000Z",
+      updatedAt: "2025-02-01T00:00:00.000Z",
+    });
+    expect(store.database.pragma("user_version", { simple: true })).toBe(3);
+    expect((store.database.prepare("PRAGMA index_list(knowledge)").all() as Array<{ name: string }>).map(({ name }) => name))
+      .toEqual(expect.arrayContaining(["knowledge_workspace_project_idx", "knowledge_origin_scope_status_idx"]));
+
+    expect(() => store.database.prepare(`
+      INSERT INTO knowledge
+        (id, type, content, workspace, project, status, created_at, updated_at, creation_origin)
+      VALUES ('bad-origin', 'fact', 'Bad origin value.', 'workspace-v2', NULL, 'candidate', '2025-02-01', '2025-02-01', 'automatic-ish')
+    `).run()).toThrow(/CHECK constraint failed/);
   });
 });

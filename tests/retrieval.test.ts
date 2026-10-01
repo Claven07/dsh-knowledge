@@ -123,6 +123,50 @@ describe("deterministic knowledge retrieval", () => {
     );
   });
 
+  it("excludes automatic candidates before scoring while keeping explicit candidates eligible", () => {
+    const explicit = create("ResponseRouter fallback policy is stable.");
+    const automatic = create("ResponseRouter fallback policy is stable.", {
+      creationOrigin: "automatic",
+    });
+
+    expect(retrieve("ResponseRouter fallback policy").map(({ knowledge }) => knowledge.id))
+      .toEqual([explicit.id]);
+    expect(repository.getById(automatic.id)?.creationOrigin).toBe("automatic");
+  });
+
+  it("retrieves automatic-origin knowledge after explicit verification", () => {
+    const automatic = create("ResponseRouter fallback policy is stable.", {
+      creationOrigin: "automatic",
+    });
+    repository.update(automatic.id, { status: "verified" });
+
+    expect(retrieve("ResponseRouter fallback policy").map(({ knowledge }) => knowledge.id))
+      .toContain(automatic.id);
+  });
+
+  it("leaves M2 scores and ordering for eligible records unchanged when automatic candidates exist", () => {
+    const explicit = create("ResponseRouter fallback policy is stable.");
+    const verified = create("ResponseRouter fallback behavior stays stable across projects.", {
+      status: "verified",
+    });
+    setTimes(explicit, timestamp, timestamp);
+    setTimes(verified, timestamp, timestamp);
+    const before = retrieve("ResponseRouter fallback policy").map(({ knowledge, score }) => ({
+      id: knowledge.id,
+      score,
+    }));
+
+    create("ResponseRouter fallback policy is stable.", { creationOrigin: "automatic" });
+    const after = retrieve("ResponseRouter fallback policy").map(({ knowledge, score }) => ({
+      id: knowledge.id,
+      score,
+    }));
+
+    expect(after).toEqual(before);
+    expect(before.some(({ id }) => id === verified.id)).toBe(true);
+    expect(before.map(({ id }) => id)).toContain(explicit.id);
+  });
+
   it("never returns archived or superseded knowledge", () => {
     const archived = create("Archived ResponseRouter fallback guidance.");
     repository.archive(archived.id);

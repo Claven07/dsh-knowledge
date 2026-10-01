@@ -6,6 +6,8 @@ export type KnowledgeStatus =
   | "superseded"
   | "archived";
 
+export type KnowledgeOrigin = "explicit" | "automatic";
+
 export type KnowledgeScope = {
   workspace: string;
   project?: string;
@@ -33,6 +35,7 @@ export type Knowledge = {
   content: string;
   scope: KnowledgeScope;
   status: KnowledgeStatus;
+  creationOrigin: KnowledgeOrigin;
   evidence: Evidence[];
   createdAt: string;
   updatedAt: string;
@@ -43,6 +46,7 @@ export type CreateKnowledgeInput = {
   content: string;
   scope: KnowledgeScope;
   evidence?: Evidence[];
+  creationOrigin?: KnowledgeOrigin;
 };
 
 export type KnowledgeListOptions = {
@@ -51,6 +55,7 @@ export type KnowledgeListOptions = {
   project?: string | null;
   type?: KnowledgeType;
   status?: KnowledgeStatus;
+  creationOrigin?: KnowledgeOrigin;
   limit?: number;
 };
 

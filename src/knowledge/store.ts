@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import Database from "better-sqlite3";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA_V1 = `
   CREATE TABLE knowledge (
@@ -69,6 +69,15 @@ const SCHEMA_V2_EVIDENCE = `
   ALTER TABLE knowledge_evidence_v2 RENAME TO knowledge_evidence;
 `;
 
+const SCHEMA_V3_ORIGIN = `
+  ALTER TABLE knowledge
+    ADD COLUMN creation_origin TEXT NOT NULL DEFAULT 'explicit'
+    CHECK (creation_origin IN ('explicit', 'automatic'));
+
+  CREATE INDEX knowledge_origin_scope_status_idx
+    ON knowledge(workspace, project, status, creation_origin);
+`;
+
 /** Opens a local SQLite database and ensures the storage schema exists. */
 export class KnowledgeStore {
   readonly database: Database.Database;
@@ -109,11 +118,20 @@ export class KnowledgeStore {
           this.database.exec(SCHEMA_V1);
           this.database.pragma("user_version = 1");
           this.migrateV1ToV2();
+          this.database.pragma("user_version = 2");
+          this.migrateV2ToV3();
           this.database.pragma(`user_version = ${SCHEMA_VERSION}`);
         })();
       } else if (currentVersion === 1) {
         this.database.transaction(() => {
           this.migrateV1ToV2();
+          this.database.pragma("user_version = 2");
+          this.migrateV2ToV3();
+          this.database.pragma(`user_version = ${SCHEMA_VERSION}`);
+        })();
+      } else if (currentVersion === 2) {
+        this.database.transaction(() => {
+          this.migrateV2ToV3();
           this.database.pragma(`user_version = ${SCHEMA_VERSION}`);
         })();
       }
@@ -125,6 +143,10 @@ export class KnowledgeStore {
 
   private migrateV1ToV2(): void {
     this.database.exec(SCHEMA_V2_EVIDENCE);
+  }
+
+  private migrateV2ToV3(): void {
+    this.database.exec(SCHEMA_V3_ORIGIN);
   }
 
   close(): void {

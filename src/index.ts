@@ -1,5 +1,9 @@
 export { KnowledgeRepository } from "./knowledge/repository.js";
 export {
+  extractKnowledgeCandidates,
+  persistKnowledgeCandidates,
+} from "./knowledge/extraction.js";
+export {
   captureFileProvenance,
   compareFileSnapshots,
   DEFAULT_GIT_COMMAND_TIMEOUT_MS,
@@ -24,11 +28,22 @@ export type {
   GitProvenance,
   Knowledge,
   KnowledgeListOptions,
+  KnowledgeOrigin,
   KnowledgePatch,
   KnowledgeScope,
   KnowledgeStatus,
   KnowledgeType,
 } from "./knowledge/types.js";
+
+export type {
+  ExtractionAuthor,
+  ExtractionEventKind,
+  ExtractionEventReference,
+  KnowledgeCandidateProposal,
+  KnowledgeDetectionResult,
+  KnowledgeExtractionInput,
+  KnowledgeExtractionResult,
+} from "./knowledge/extraction.js";
 
 export type {
   CaptureFileProvenanceOptions,

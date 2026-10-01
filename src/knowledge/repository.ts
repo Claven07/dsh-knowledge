@@ -6,6 +6,7 @@ import type {
   GitProvenance,
   Knowledge,
   KnowledgeListOptions,
+  KnowledgeOrigin,
   KnowledgePatch,
   KnowledgeScope,
   KnowledgeStatus,
@@ -23,6 +24,7 @@ type KnowledgeRow = {
   status: KnowledgeStatus;
   created_at: string;
   updated_at: string;
+  creation_origin: KnowledgeOrigin;
 };
 
 type EvidenceRow = {
@@ -43,6 +45,7 @@ const KNOWLEDGE_STATUSES: KnowledgeStatus[] = [
   "superseded",
   "archived",
 ];
+const KNOWLEDGE_ORIGINS: KnowledgeOrigin[] = ["explicit", "automatic"];
 const EVIDENCE_TYPES: EvidenceType[] = ["session", "file", "git"];
 
 /** Persists and queries evidence-backed knowledge items. */
@@ -65,8 +68,8 @@ export class KnowledgeRepository {
       this.database
         .prepare(
           `INSERT INTO knowledge
-            (id, type, content, workspace, project, status, created_at, updated_at)
-           VALUES (@id, @type, @content, @workspace, @project, 'candidate', @createdAt, @createdAt)`,
+            (id, type, content, workspace, project, status, created_at, updated_at, creation_origin)
+           VALUES (@id, @type, @content, @workspace, @project, 'candidate', @createdAt, @createdAt, @creationOrigin)`,
         )
         .run({
           id,
@@ -75,6 +78,7 @@ export class KnowledgeRepository {
           workspace: scope.workspace,
           project: scope.project ?? null,
           createdAt,
+          creationOrigin: validateKnowledgeOrigin(input.creationOrigin ?? "explicit"),
         });
 
       this.replaceEvidence(id, evidence);
@@ -114,6 +118,7 @@ export class KnowledgeRepository {
       content: row.content,
       scope,
       status: row.status,
+      creationOrigin: row.creation_origin,
       evidence: evidenceRows.map((item) => {
         const evidence: Evidence = {
           type: item.type,
@@ -304,6 +309,11 @@ function buildFilters(options: KnowledgeListOptions): {
     clauses.push("status = @status");
     params.status = options.status;
   }
+  if (options.creationOrigin !== undefined) {
+    validateKnowledgeOrigin(options.creationOrigin);
+    clauses.push("creation_origin = @creationOrigin");
+    params.creationOrigin = options.creationOrigin;
+  }
 
   return {
     where: clauses.length === 0 ? "" : ` WHERE ${clauses.join(" AND ")}`,
@@ -332,6 +342,13 @@ function validateKnowledgeType(value: KnowledgeType): KnowledgeType {
 function validateKnowledgeStatus(value: KnowledgeStatus): KnowledgeStatus {
   if (!KNOWLEDGE_STATUSES.includes(value)) {
     throw new TypeError(`Invalid knowledge status: ${String(value)}`);
+  }
+  return value;
+}
+
+function validateKnowledgeOrigin(value: KnowledgeOrigin): KnowledgeOrigin {
+  if (!KNOWLEDGE_ORIGINS.includes(value)) {
+    throw new TypeError(`Invalid knowledge creation origin: ${String(value)}`);
   }
   return value;
 }

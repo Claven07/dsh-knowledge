@@ -60,9 +60,12 @@ The SQLite file defaults to `$DSH_HOME/knowledge/knowledge.sqlite`, using the Ha
   name: dsh-knowledge/plugin
   config:
     project: payments
+    automaticExtraction: true
 ```
 
 The override replaces the row's full config, so include every setting you need to retain. When no project label is configured, automatic retrieval considers workspace-wide items only; the current Session API supplies `cwd` but no project identity. Tool calls default to the configured project and can pass `project: null` to select or create workspace-wide knowledge.
+
+Automatic extraction is opt-in and defaults to `false`. Enable it with `automaticExtraction: true` in the plugin configuration. Extracted items have `creationOrigin: "automatic"` and remain candidates. They are visible to `knowledge_list` (filter with `creationOrigin: "automatic"`) but are excluded from M2 retrieval until explicitly verified. There is no model-facing verification tool.
 
 ## Core usage
 
@@ -128,6 +131,7 @@ The aggregate status describes Git-backed file evidence. Session evidence does n
 DeepSeek Harness hooks and tools
             │
             ├── session/event ── injection-ID deduplication
+            ├── session/event + turn boundaries ── bounded candidate extraction (opt-in)
             ├── agent/pre-step ─ retrieval and compact context
             └── ctx.tools.register() ─ model-facing knowledge tools and freshness check
                                   │
@@ -144,7 +148,17 @@ DeepSeek Harness hooks and tools
 
 The adapter gets a workspace from the active session's `header.cwd`. The project name is configured explicitly because the current Session header does not provide one. Tool calls can pass workspace/project filters. A configured project is the default exact scope; without a configured project, tools default to workspace-wide knowledge only. `knowledge_add`, `knowledge_search`, `knowledge_list`, `knowledge_get`, and `knowledge_archive` accept `project: null` to select workspace-wide scope explicitly. Tool-created knowledge uses `exec.agent.session.id` for session evidence and timestamps evidence at creation time.
 
-Before an agent request, `agent/pre-step` passes the latest user-authored text in the proposed step to the core retrieval engine. It retrieves at most four items and injects no more than 1,800 characters in a `<dsh-knowledge>` block. Stored text is quoted and labeled untrusted; directives in it should not be followed. Retrieval considers candidate and verified knowledge only. If a project is configured, exact-project entries rank above workspace-wide entries when textual relevance is equal; verified entries rank above candidates at equal scope. If no project is configured, retrieval is workspace-wide only. A session event observer remembers committed injected IDs in memory, scans a session transcript once to cover sessions present at plugin load, and releases state on session disposal; events are not stored in SQLite.
+Before an agent request, `agent/pre-step` passes the latest user-authored text in the proposed step to the core retrieval engine. It retrieves at most four items and injects no more than 1,800 characters in a `<dsh-knowledge>` block. Stored text is quoted and labeled untrusted; directives in it should not be followed. Retrieval considers verified knowledge and explicit-origin candidates; automatic-origin candidates are excluded until explicitly verified. If a project is configured, exact-project entries rank above workspace-wide entries when textual relevance is equal; verified entries rank above candidates at equal scope. If no project is configured, retrieval is workspace-wide only. A session event observer remembers committed injected IDs in memory, scans a session transcript once to cover sessions present at plugin load, and releases state on session disposal; events are not stored in SQLite.
+
+## Automatic candidate extraction (M4)
+
+When enabled, the Harness adapter collects only bounded references to direct human-authored `user/message` events (`source.kind === "user"`) during a turn. After `turn/end`, a process-wide single-worker queue runs a conservative deterministic rule set outside the event callback. It recognizes a small set of explicit project decisions, project facts, corrections, durable constraints, and causal failure/fix statements. It does not infer knowledge from assistant assertions, model tool arguments, or tool success alone.
+
+Every extracted item is stored as a candidate with automatic origin and session evidence containing the session ID, event sequence locator, and event timestamp. Conversation text is transient input: no raw transcript or excerpts are added to evidence. The event count, text length, candidate count, queue size, and shutdown wait are bounded; overflow and failures drop work without interrupting the agent task.
+
+Before persistence, a deterministic filter rejects common API key, bearer/JWT, credential assignment, connection-string, and private-key patterns. Rejected content is not logged or redacted into a candidate. Same-scope, same-type duplicates are suppressed using the conservative M2 duplicate predicate; existing knowledge is never merged or changed. Candidates that appear to disagree with verified knowledge are not automatically promoted or superseded.
+
+This is intentionally a narrow rules-first detector. It may miss valid knowledge and does not provide general language understanding, LLM extraction, confidence scores, or a verification workflow. Review candidates with `knowledge_list`; M2 will use one only after an explicit caller changes its status to verified.
 
 ## Deterministic retrieval (M2)
 
@@ -178,10 +192,10 @@ Candidate collection scans active records in the explicitly selected workspace/p
 - Freshness is a bounded, on-demand snapshot comparison, not continuous monitoring. It compares committed snapshots and the current worktree; it does not detect every historical edit that was later reverted.
 - Git may not safely compare files with configured clean/process filters, symlinked path components, or index flags such as `assume-unchanged` and `skip-worktree`; those checks return `unverifiable`. Provenance capture also requires an ordinary tracked worktree file and an index entry with no hidden-state flags.
 - No Git network operations are performed. Missing objects are reported as unverifiable rather than fetched.
-- Knowledge input is bounded through DSH tools, but the standalone M0 repository remains unbounded and neither layer scans for secrets. Do not store credentials or other sensitive values.
+- Explicit knowledge input through the repository or Harness tools is not secret-scanned. The M4 filter applies only to automatic candidates and recognizes common formats; it cannot guarantee detection of every sensitive or personal value. Do not store credentials or other sensitive values.
 - `repository.search()` remains literal SQLite `LIKE` matching. M2 ranked retrieval is deterministic lexical matching, not semantic search; candidate collection scans the active records in scope.
 - Knowledge is local to one SQLite database and is not synchronized.
-- Automatic knowledge extraction, continuous/automatic stale-knowledge monitoring, and automatic lesson generation are not implemented.
+- Continuous stale-knowledge monitoring and a dedicated candidate review/verification workflow are not implemented.
 - Adapter tests use the published DSH tool definitions and typed fixtures; they do not boot a complete DSH profile or model adapter.
 
 ## Roadmap
@@ -190,8 +204,8 @@ Candidate collection scans active records in the explicitly selected workspace/p
 - **M1 DSH tools** — completed
 - **M2 Intelligent deterministic retrieval** — completed; ranked local text retrieval is used by bounded pre-step context injection
 - **M3 Git-aware provenance and on-demand freshness** — completed
-- **M4 Automatic staleness monitoring** — future
-- **M5 Automatic lessons** — future
-- **M6 Git-aware project knowledge** — future
+- **M4 Automatic knowledge and lesson candidate extraction** — implemented; opt-in and candidate-only
+- **M5 Automatic staleness monitoring** — future; M3 freshness checks remain explicit and read-only
+- **M6 Candidate review workflow and richer Git-aware knowledge** — future
 
-Future work includes automatic knowledge extraction, continuous stale-knowledge monitoring, automatic lesson generation, and richer Git-aware project knowledge. These are not current capabilities.
+Future work includes continuous stale-knowledge monitoring and a dedicated candidate review workflow. These are not current capabilities.

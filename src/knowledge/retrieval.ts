@@ -195,7 +195,8 @@ function loadCandidates(
       }
     }
   }
-  return [...byId.values()];
+  return [...byId.values()].filter((knowledge) =>
+    !(knowledge.status === "candidate" && knowledge.creationOrigin === "automatic"));
 }
 
 function matchText(
@@ -357,7 +358,11 @@ function suppressSimilarResults(
   return selected;
 }
 
-function areConservativeDuplicates(left: Knowledge, right: Knowledge): boolean {
+/** M2's existing conservative duplicate predicate, shared with candidate admission. */
+export function areConservativeDuplicates(
+  left: Pick<Knowledge, "type" | "content" | "scope">,
+  right: Pick<Knowledge, "type" | "content" | "scope">,
+): boolean {
   if (
     left.type !== right.type ||
     left.scope.workspace !== right.scope.workspace ||
