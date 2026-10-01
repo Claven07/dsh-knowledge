@@ -13,11 +13,18 @@ export type KnowledgeScope = {
 
 export type EvidenceType = "session" | "file" | "git";
 
+/** A file snapshot in a specific Git commit. Paths use Git's `/` separators. */
+export type GitProvenance = {
+  commit: string;
+  path: string;
+};
+
 export type Evidence = {
   type: EvidenceType;
   source: string;
   locator?: string;
   timestamp: string;
+  gitProvenance?: GitProvenance;
 };
 
 export type Knowledge = {

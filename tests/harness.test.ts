@@ -23,6 +23,7 @@ import {
 } from "../src/harness/retrieval.js";
 import plugin, { apply, type Config } from "../src/harness/plugin.js";
 import type { KnowledgePreStepHandler } from "../src/harness/retrieval.js";
+import { createTemporaryGitRepository, initializeGitRepository } from "./git-fixtures.js";
 
 type Listener = (...args: never[]) => unknown;
 
@@ -51,7 +52,7 @@ afterEach(async () => {
 });
 
 describe("DeepSeek Harness plugin adapters", () => {
-  it("initializes the plugin and registers the five supported tools", () => {
+  it("initializes the plugin and registers the supported tools", () => {
     const harness = createPluginHarness();
 
     expect(plugin).toMatchObject({ name: "dsh-knowledge", inject: ["tools"], apply });
@@ -61,6 +62,7 @@ describe("DeepSeek Harness plugin adapters", () => {
       "knowledge_list",
       "knowledge_get",
       "knowledge_archive",
+      "knowledge_check_freshness",
     ]);
     expect(harness.listeners.has("session/event")).toBe(true);
     expect(harness.listeners.has("session/disposed")).toBe(true);
@@ -172,6 +174,7 @@ describe("DeepSeek Harness plugin adapters", () => {
         timestamp: expect.any(String),
       },
     ]);
+    expect(result.provenanceCapture).toMatchObject({ attempted: 1, captured: 0, skipped: 1 });
     expect(Date.parse(stored!.evidence[0]!.timestamp)).not.toBeNaN();
   });
 
@@ -202,6 +205,72 @@ describe("DeepSeek Harness plugin adapters", () => {
 
     const stored = openRepository(harness.path).getById(result.item!.id);
     expect(stored?.scope).toEqual({ workspace: "C:\\workspace" });
+  });
+
+  it("knowledge_add captures clean file provenance and freshness checks are concise and read-only", async () => {
+    const repo = createTemporaryGitRepository("dsh-knowledge-harness-git-");
+    try {
+      await initializeGitRepository(repo.directory);
+      repo.write("src/policy.ts", "export const policy = 'allow';\n");
+      const commit = await repo.commit("policy");
+      const harness = createPluginHarness({ project: "payments" });
+      const session = makeSession(repo.directory);
+
+      const created = await harness.invoke("knowledge_add", {
+        type: "decision",
+        content: "Use the policy module for authorization.",
+        workspace: repo.directory,
+        project: "payments",
+        evidence: [{ type: "file", source: "src/policy.ts" }],
+      }, session) as ToolItemResult;
+      expect(created.provenanceCapture).toMatchObject({ attempted: 1, captured: 1, skipped: 0 });
+
+      const stored = openRepository(harness.path).getById(created.item!.id)!;
+      expect(stored.evidence[0]?.gitProvenance).toEqual({ commit, path: "src/policy.ts" });
+
+      const checked = await harness.invoke("knowledge_check_freshness", {
+        id: stored.id,
+      }, session) as {
+        ok: boolean;
+        knowledgeStatus?: string;
+        report: { status: string; evidence: Array<{ status: string; reason?: string }> } | null;
+      };
+      expect(checked).toMatchObject({
+        ok: true,
+        knowledgeStatus: "candidate",
+        report: { status: "current", evidence: [{ status: "current" }, { status: "unverifiable", reason: "not_file_evidence" }] },
+      });
+      expect(JSON.stringify(checked)).not.toContain("policy =");
+
+      repo.write("src/policy.ts", "export const policy = 'deny';\n");
+      const stale = await harness.invoke("knowledge_check_freshness", { id: stored.id }, session) as typeof checked;
+      expect(stale.report?.status).toBe("potentially_stale");
+      expect(stale.knowledgeStatus).toBe("candidate");
+      expect(openRepository(harness.path).getById(stored.id)?.status).toBe("candidate");
+    } finally {
+      repo.cleanup();
+    }
+  }, 20_000);
+
+  it("freshness tool hides knowledge outside the active workspace or configured project", async () => {
+    const harness = createPluginHarness({ project: "payments" });
+    const repo = openRepository(harness.path);
+    const otherWorkspace = repo.create({
+      type: "fact",
+      content: "Other workspace knowledge.",
+      scope: { workspace: "C:\\workspace\\other", project: "payments" },
+    });
+    const otherProject = repo.create({
+      type: "fact",
+      content: "Other project knowledge.",
+      scope: { workspace: "C:\\workspace\\payments", project: "identity" },
+    });
+    const session = makeSession("C:\\workspace\\payments");
+
+    await expect(harness.invoke("knowledge_check_freshness", { id: otherWorkspace.id }, session))
+      .resolves.toEqual({ ok: true, report: null });
+    await expect(harness.invoke("knowledge_check_freshness", { id: otherProject.id }, session))
+      .resolves.toEqual({ ok: true, report: null });
   });
 
   it("bounds model-supplied content, query, and evidence before storage or search", async () => {
@@ -743,6 +812,12 @@ type ToolSummary = {
 type ToolItemResult = {
   ok: boolean;
   item: ToolSummary | null;
+  provenanceCapture?: {
+    attempted: number;
+    captured: number;
+    skipped: number;
+    warnings: Array<{ evidenceIndex: number; reason: string }>;
+  };
 };
 
 type ToolListResult = {

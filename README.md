@@ -6,20 +6,22 @@ Ordinary chat memory often retains conversational details without showing what a
 
 ## Status
 
-M0 core storage, M1 native DeepSeek Harness tools, and M2 deterministic ranked retrieval are implemented. **DeepSeek Harness integration was not part of M0; it is implemented as the separate `dsh-knowledge/plugin` entry point.** The storage/domain and retrieval APIs remain usable without DeepSeek Harness.
+M0 core storage, M1 native DeepSeek Harness tools, M2 deterministic ranked retrieval, and M3 Git provenance with on-demand freshness checks are implemented. **The Harness adapter remains the separate `dsh-knowledge/plugin` entry point.** Storage, retrieval, Git provenance, and freshness APIs remain usable without DeepSeek Harness.
 
 ## Capabilities
 
 - Local SQLite storage through `better-sqlite3`; no ORM or remote service.
 - Create, get, list, deterministic `LIKE` search, update, archive, and supersede knowledge through the core repository.
 - Normalized evidence records and workspace/project scope.
-- Five DSH tools: `knowledge_add`, `knowledge_search`, `knowledge_list`, `knowledge_get`, and `knowledge_archive`.
+- Six DSH tools: `knowledge_add`, `knowledge_search`, `knowledge_list`, `knowledge_get`, `knowledge_archive`, and `knowledge_check_freshness`.
+- `knowledge_add` opportunistically attaches the current commit and repository-relative path to clean, committed file evidence in the active session workspace.
+- `knowledge_check_freshness` compares Git-backed file evidence with the current repository snapshot without modifying knowledge or Git state.
 - Session evidence on explicit tool-created items when DSH provides a calling agent/session.
 - Bounded model inputs and results; the add tool advises against persisting credentials or secrets (there is no secret scanner).
 - Bounded `agent/pre-step` retrieval from the current workspace and optional configured project. It ranks relevant project entries before workspace-wide entries, prefers verified entries at equal scope, excludes archived/superseded entries, suppresses conservative near-duplicates, and injects compact context only.
 - Retrieval/storage failures are logged and do not stop agent execution.
 
-There is no automatic LLM extraction, embeddings, vector search, external API, HTTP server, or UI.
+There is no automatic LLM extraction, embeddings, vector search, external API, HTTP server, or UI. Git inspection is local and read-only; the plugin never fetches or contacts a remote.
 
 ## Installation
 
@@ -106,6 +108,20 @@ store.close();
 
 `create()` assigns a UUID and timestamps and starts an item as `candidate`. Candidates can be verified or archived. Verified items can be archived or superseded by another verified item in the same scope; superseded items can be archived.
 
+## Git provenance and freshness (M3)
+
+File evidence may include structured `gitProvenance` containing a full Git commit object ID and a repository-relative path. SQLite schema v2 stores these fields separately from evidence text; existing schema v1 evidence migrates with no Git provenance and remains valid.
+
+The Harness `knowledge_add` tool attempts capture for explicit file evidence only when its workspace matches the active session `cwd`. Capture succeeds only for a tracked file present in `HEAD` with no relevant staged or working-tree changes. A failed or unsafe inspection does not prevent knowledge creation; the tool returns a concise capture outcome. Paths are normalized to Git `/` separators and must remain repository-relative.
+
+`checkKnowledgeFreshness(knowledge, { workspaceDirectory })` and the `knowledge_check_freshness` tool produce per-evidence results with one of these statuses:
+
+- **current** — the current file snapshot matches the recorded commit snapshot.
+- **potentially_stale** — the file was modified, deleted, renamed away, or differs in the current working tree/index.
+- **unverifiable** — provenance is absent, Git or required objects are unavailable, the operation times out, or safe comparison cannot be guaranteed.
+
+The aggregate status describes Git-backed file evidence. Session evidence does not count as proof of file freshness, and legacy file evidence without Git provenance is reported as unverifiable. A restored file snapshot can be current even if Git history contains an intermediate edit. Freshness never changes candidate, verified, superseded, or archived status and does not prove a claim true or false. Checks are bounded, do not return diffs/source contents, do not follow renames, and never fetch missing objects.
+
 ## DSH architecture
 
 ```text
@@ -113,7 +129,7 @@ DeepSeek Harness hooks and tools
             │
             ├── session/event ── injection-ID deduplication
             ├── agent/pre-step ─ retrieval and compact context
-            └── ctx.tools.register() ─ model-facing knowledge tools
+            └── ctx.tools.register() ─ model-facing knowledge tools and freshness check
                                   │
                        DSH adapter package
                                   │
@@ -158,11 +174,14 @@ Candidate collection scans active records in the explicitly selected workspace/p
 
 - DSH integration is limited to its plugin tools, the current session identity for explicit tool-created evidence, and conservative pre-step retrieval. It does not capture every session event.
 - Project identity must be configured; `cwd` is used as the workspace value without filesystem canonicalization.
-- Evidence references are supplied by the caller. Git evidence discovery, file validation, and provenance verification are not implemented.
+- Only explicit file evidence in the active session workspace is considered for opportunistic provenance capture. Other references remain caller-supplied.
+- Freshness is a bounded, on-demand snapshot comparison, not continuous monitoring. It compares committed snapshots and the current worktree; it does not detect every historical edit that was later reverted.
+- Git may not safely compare files with configured clean/process filters, symlinked path components, or index flags such as `assume-unchanged` and `skip-worktree`; those checks return `unverifiable`. Provenance capture also requires an ordinary tracked worktree file and an index entry with no hidden-state flags.
+- No Git network operations are performed. Missing objects are reported as unverifiable rather than fetched.
 - Knowledge input is bounded through DSH tools, but the standalone M0 repository remains unbounded and neither layer scans for secrets. Do not store credentials or other sensitive values.
 - `repository.search()` remains literal SQLite `LIKE` matching. M2 ranked retrieval is deterministic lexical matching, not semantic search; candidate collection scans the active records in scope.
 - Knowledge is local to one SQLite database and is not synchronized.
-- Automatic knowledge extraction, stale knowledge detection, and automatic lesson generation are not implemented.
+- Automatic knowledge extraction, continuous/automatic stale-knowledge monitoring, and automatic lesson generation are not implemented.
 - Adapter tests use the published DSH tool definitions and typed fixtures; they do not boot a complete DSH profile or model adapter.
 
 ## Roadmap
@@ -170,9 +189,9 @@ Candidate collection scans active records in the explicitly selected workspace/p
 - **M0 Core storage** — completed
 - **M1 DSH tools** — completed
 - **M2 Intelligent deterministic retrieval** — completed; ranked local text retrieval is used by bounded pre-step context injection
-- **M3 Evidence/provenance integration** — future
-- **M4 Staleness detection** — future
+- **M3 Git-aware provenance and on-demand freshness** — completed
+- **M4 Automatic staleness monitoring** — future
 - **M5 Automatic lessons** — future
 - **M6 Git-aware project knowledge** — future
 
-Future work includes automatic knowledge extraction, Git evidence, stale knowledge detection, automatic lesson generation, and advanced retrieval. These are not current capabilities.
+Future work includes automatic knowledge extraction, continuous stale-knowledge monitoring, automatic lesson generation, and richer Git-aware project knowledge. These are not current capabilities.

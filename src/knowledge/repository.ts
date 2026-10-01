@@ -3,6 +3,7 @@ import type {
   CreateKnowledgeInput,
   Evidence,
   EvidenceType,
+  GitProvenance,
   Knowledge,
   KnowledgeListOptions,
   KnowledgePatch,
@@ -11,6 +12,7 @@ import type {
   KnowledgeType,
 } from "./types.js";
 import { KnowledgeStore } from "./store.js";
+import { normalizeGitCommit, normalizeRepositoryRelativePath } from "./git.js";
 
 type KnowledgeRow = {
   id: string;
@@ -28,6 +30,8 @@ type EvidenceRow = {
   source: string;
   locator: string | null;
   timestamp: string;
+  git_commit: string | null;
+  git_path: string | null;
 };
 
 type SqlParams = Record<string, string | number>;
@@ -92,7 +96,7 @@ export class KnowledgeRepository {
 
     const evidenceRows = this.database
       .prepare(
-        `SELECT type, source, locator, timestamp
+        `SELECT type, source, locator, timestamp, git_commit, git_path
          FROM knowledge_evidence
          WHERE knowledge_id = ?
          ORDER BY ordinal ASC`,
@@ -118,6 +122,12 @@ export class KnowledgeRepository {
         };
         if (item.locator !== null) {
           evidence.locator = item.locator;
+        }
+        if (item.git_commit !== null && item.git_path !== null) {
+          evidence.gitProvenance = {
+            commit: item.git_commit,
+            path: item.git_path,
+          };
         }
         return evidence;
       }),
@@ -241,8 +251,8 @@ export class KnowledgeRepository {
       .run(id);
     const insert = this.database.prepare(
       `INSERT INTO knowledge_evidence
-        (knowledge_id, ordinal, type, source, locator, timestamp)
-       VALUES (@knowledgeId, @ordinal, @type, @source, @locator, @timestamp)`,
+        (knowledge_id, ordinal, type, source, locator, timestamp, git_commit, git_path)
+       VALUES (@knowledgeId, @ordinal, @type, @source, @locator, @timestamp, @gitCommit, @gitPath)`,
     );
     evidence.forEach((item, ordinal) => {
       insert.run({
@@ -252,6 +262,8 @@ export class KnowledgeRepository {
         source: item.source,
         locator: item.locator ?? null,
         timestamp: item.timestamp,
+        gitCommit: item.gitProvenance?.commit ?? null,
+        gitPath: item.gitProvenance?.path ?? null,
       });
     });
   }
@@ -368,6 +380,20 @@ function normalizeEvidence(evidence: Evidence[]): Evidence[] {
       throw new TypeError(`Evidence timestamp must be an ISO timestamp: ${String(item.timestamp)}`);
     }
 
+    let gitProvenance: GitProvenance | undefined;
+    if (item.gitProvenance !== undefined) {
+      if (item.type !== "file") {
+        throw new TypeError("Git provenance can only be attached to file evidence.");
+      }
+      if (typeof item.gitProvenance !== "object" || item.gitProvenance === null) {
+        throw new TypeError("Git provenance must include a commit and repository-relative path.");
+      }
+      gitProvenance = {
+        commit: normalizeGitCommit(item.gitProvenance.commit),
+        path: normalizeRepositoryRelativePath(item.gitProvenance.path),
+      };
+    }
+
     const normalized: Evidence = {
       type: item.type,
       source: item.source,
@@ -375,6 +401,9 @@ function normalizeEvidence(evidence: Evidence[]): Evidence[] {
     };
     if (item.locator !== undefined) {
       normalized.locator = item.locator;
+    }
+    if (gitProvenance !== undefined) {
+      normalized.gitProvenance = gitProvenance;
     }
     return normalized;
   });

@@ -1,6 +1,8 @@
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { InferValue, ToolRuntime, ToolRunContext } from "@deepseek-ai/dsh-tools";
 import type { KnowledgeRepository } from "../knowledge/repository.js";
+import { captureFileProvenance, MAX_GIT_EVIDENCE_CHECKS } from "../knowledge/git.js";
+import { checkKnowledgeFreshness } from "../knowledge/freshness.js";
 import type {
   Evidence,
   EvidenceType,
@@ -24,6 +26,9 @@ const MAX_ID_CHARS = 128;
 const LIST_CONTENT_LIMIT = 280;
 const GET_CONTENT_LIMIT = 1_200;
 const MAX_RETURNED_EVIDENCE = 8;
+const MAX_CAPTURE_FILES_PER_ADD = 8;
+const MAX_CAPTURE_BUDGET_MS = 5_000;
+const MAX_GIT_COMMAND_TIMEOUT_MS = 1_500;
 
 const evidenceSummarySchema = {
   type: "object",
@@ -65,6 +70,78 @@ const singleItemOutputSchema = {
         ok: { type: "boolean", const: true, required: true },
         item: {
           oneOf: [knowledgeSummarySchema, { type: "null" }],
+          required: true,
+        },
+        provenanceCapture: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            attempted: { type: "integer", required: true },
+            captured: { type: "integer", required: true },
+            skipped: { type: "integer", required: true },
+            warnings: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  evidenceIndex: { type: "integer", required: true },
+                  reason: { type: "string", required: true },
+                },
+              },
+              required: true,
+            },
+          },
+        },
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ok: { type: "boolean", const: false, required: true },
+        error: { type: "string", required: true },
+      },
+    },
+  ],
+} as const;
+
+const freshnessOutputSchema = {
+  oneOf: [
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ok: { type: "boolean", const: true, required: true },
+        knowledgeStatus: { type: "string", enum: KNOWLEDGE_STATUSES },
+        report: {
+          oneOf: [
+            {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                knowledgeId: { type: "string", required: true },
+                checkedAt: { type: "string", required: true },
+                status: { type: "string", enum: ["current", "potentially_stale", "unverifiable"], required: true },
+                evidenceCount: { type: "integer", required: true },
+                evidenceTruncated: { type: "boolean", required: true },
+                evidence: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      evidenceIndex: { type: "integer", required: true },
+                      status: { type: "string", enum: ["current", "potentially_stale", "unverifiable"], required: true },
+                      reason: { type: "string" },
+                    },
+                  },
+                  required: true,
+                },
+              },
+            },
+            { type: "null" },
+          ],
           required: true,
         },
       },
@@ -110,7 +187,7 @@ export type KnowledgeRepositoryProvider = () => KnowledgeRepository | null;
 
 export type KnowledgeToolRegistrar = Pick<ToolRuntime, "register">;
 
-/** Register the five model-facing knowledge tools in the current Cordis fiber. */
+/** Register the model-facing knowledge tools in the current Cordis fiber. */
 export function registerKnowledgeTools(
   tools: KnowledgeToolRegistrar,
   getRepository: KnowledgeRepositoryProvider,
@@ -171,6 +248,15 @@ export function registerKnowledgeTools(
       validateEvidence(args.evidence ?? []);
 
       const createdAt = new Date().toISOString();
+      const capture: {
+        attempted: number;
+        captured: number;
+        skipped: number;
+        warnings: Array<{ evidenceIndex: number; reason: string }>;
+      } = { attempted: 0, captured: 0, skipped: 0, warnings: [] };
+      const captureStartedAt = Date.now();
+      let captureSlots = 0;
+      const sessionWorkspace = exec.agent?.session.header.cwd;
       const evidence: Evidence[] = (args.evidence ?? []).map((item) => {
         const entry: Evidence = {
           type: item.type as EvidenceType,
@@ -182,6 +268,45 @@ export function registerKnowledgeTools(
         }
         return entry;
       });
+
+      for (let index = 0; index < evidence.length; index += 1) {
+        const entry = evidence[index]!;
+        if (entry.type !== "file") {
+          continue;
+        }
+        capture.attempted += 1;
+        let skippedReason: string | undefined;
+        if (typeof sessionWorkspace !== "string" || sessionWorkspace.length === 0) {
+          skippedReason = "missing_session_workspace";
+        } else if (args.workspace !== sessionWorkspace) {
+          skippedReason = "workspace_mismatch";
+        } else if (captureSlots >= MAX_CAPTURE_FILES_PER_ADD) {
+          skippedReason = "evidence_limit_exceeded";
+        } else {
+          const remaining = MAX_CAPTURE_BUDGET_MS - (Date.now() - captureStartedAt);
+          if (remaining < 1) {
+            skippedReason = "operation_budget_exceeded";
+          } else {
+            captureSlots += 1;
+            const result = await captureFileProvenance({
+              workspaceDirectory: sessionWorkspace,
+              filePath: entry.source,
+              commandTimeoutMs: Math.min(MAX_GIT_COMMAND_TIMEOUT_MS, remaining),
+              operationBudgetMs: remaining,
+            });
+            if (result.status === "captured") {
+              entry.gitProvenance = result.provenance;
+              capture.captured += 1;
+            } else {
+              skippedReason = result.reason;
+            }
+          }
+        }
+        if (skippedReason !== undefined) {
+          capture.skipped += 1;
+          capture.warnings.push({ evidenceIndex: index, reason: skippedReason });
+        }
+      }
 
       const sessionId = exec.agent?.session.id;
       if (
@@ -201,7 +326,11 @@ export function registerKnowledgeTools(
         },
         evidence,
       });
-      return { ok: true, item: summarize(item, GET_CONTENT_LIMIT, false) };
+      return {
+        ok: true,
+        item: summarize(item, GET_CONTENT_LIMIT, false),
+        ...(capture.attempted === 0 ? {} : { provenanceCapture: capture }),
+      };
     },
   });
 
@@ -368,7 +497,55 @@ export function registerKnowledgeTools(
     },
   });
 
-  for (const tool of [addTool, searchTool, listTool, getTool, archiveTool]) {
+  const freshnessTool = defineTool({
+    name: "knowledge_check_freshness",
+    description: "Check whether Git-backed file evidence still matches the active workspace snapshot. This is a read-only signal and does not change knowledge status.",
+    parameters: {
+      id: { type: "string", required: true, description: "Knowledge ID in the active workspace and configured project scope." },
+    },
+    output: {
+      schema: freshnessOutputSchema,
+      render: (_args, value) => [
+        { type: "text", text: renderJson(value) },
+      ],
+    },
+    async execute(args, exec) {
+      const repository = getRepository();
+      if (repository === null) {
+        return unavailable();
+      }
+      const workspace = resolveWorkspace(undefined, exec);
+      if (workspace === undefined) {
+        return missingWorkspace();
+      }
+      validateBoundedText(args.id, "id", MAX_ID_CHARS);
+      const item = repository.getById(args.id);
+      if (!isInScope(item, workspace, resolveProject(undefined, config.project))) {
+        return { ok: true, report: null };
+      }
+
+      const report = await checkKnowledgeFreshness(item, { workspaceDirectory: workspace });
+      const visibleEvidence = report.evidence.slice(0, MAX_GIT_EVIDENCE_CHECKS);
+      return {
+        ok: true,
+        knowledgeStatus: item.status,
+        report: {
+          knowledgeId: report.knowledgeId,
+          checkedAt: report.checkedAt,
+          status: report.status,
+          evidenceCount: report.evidence.length,
+          evidenceTruncated: report.evidence.length > visibleEvidence.length,
+          evidence: visibleEvidence.map((entry) => ({
+            evidenceIndex: entry.evidenceIndex,
+            status: entry.status,
+            ...(entry.reason === undefined ? {} : { reason: entry.reason }),
+          })),
+        },
+      };
+    },
+  });
+
+  for (const tool of [addTool, searchTool, listTool, getTool, archiveTool, freshnessTool]) {
     tools.register(tool);
   }
 }

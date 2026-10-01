@@ -70,6 +70,31 @@ describe("KnowledgeRepository", () => {
       expect(repository.getById("missing-id")).toBeNull();
     });
 
+    it("round-trips normalized SHA-1 and SHA-256 file provenance", () => {
+      const item = repository.create(input({
+        evidence: [
+          {
+            type: "file",
+            source: "src/router.ts",
+            timestamp,
+            gitProvenance: { commit: "A".repeat(40), path: "./src\\router.ts" },
+          },
+          {
+            type: "file",
+            source: "src/store.ts",
+            timestamp,
+            gitProvenance: { commit: "b".repeat(64), path: "src/store.ts" },
+          },
+        ],
+      }));
+
+      expect(item.evidence[0]?.gitProvenance).toEqual({
+        commit: "a".repeat(40),
+        path: "src/router.ts",
+      });
+      expect(repository.getById(item.id)).toEqual(item);
+    });
+
     it("stores workspace-wide knowledge without adding a project field", () => {
       const created = repository.create(input({ scope: { workspace: "workspace-a" } }));
 
@@ -82,6 +107,33 @@ describe("KnowledgeRepository", () => {
         { type: "file", source: "README.md", timestamp: "yesterday" },
       ];
       expect(() => repository.create(input({ evidence: invalidEvidence }))).toThrow(/ISO timestamp/);
+    });
+
+    it.each([
+      { commit: "not-a-commit", path: "README.md" },
+      { commit: "a".repeat(40), path: "../outside.ts" },
+      { commit: "a".repeat(40), path: "C:\\outside.ts" },
+      { commit: "a".repeat(40), path: "" },
+    ])("rejects invalid Git provenance $commit $path", (gitProvenance) => {
+      expect(() => repository.create(input({
+        evidence: [{
+          type: "file",
+          source: "README.md",
+          timestamp,
+          gitProvenance,
+        }],
+      }))).toThrow();
+    });
+
+    it("only permits Git provenance on file evidence", () => {
+      expect(() => repository.create(input({
+        evidence: [{
+          type: "session",
+          source: "session-1",
+          timestamp,
+          gitProvenance: { commit: "a".repeat(40), path: "README.md" },
+        }],
+      }))).toThrow(/file evidence/);
     });
   });
 
