@@ -2,7 +2,8 @@ import type { Agent, PreStepDecision } from "@deepseek-ai/dsh-agent";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import type { UserMessage } from "@deepseek-ai/dsh-session";
 import type { KnowledgeRepository } from "../knowledge/repository.js";
-import type { Knowledge, KnowledgeStatus } from "../knowledge/types.js";
+import { MAX_RETRIEVAL_RESULTS, retrieveRelevantKnowledge } from "../knowledge/retrieval.js";
+import type { Knowledge } from "../knowledge/types.js";
 import {
   KNOWLEDGE_CONTEXT_SOURCE,
   KnowledgeInjectionTracker,
@@ -12,7 +13,6 @@ export const MAX_INJECTED_KNOWLEDGE_ITEMS = 4;
 export const MAX_INJECTED_CONTEXT_CHARS = 1_800;
 const MAX_SEARCH_TERMS = 4;
 const MAX_SEARCH_TERM_CHARS = 64;
-const MAX_SEARCH_CANDIDATES_PER_TERM = 12;
 const MAX_ITEM_CONTEXT_CHARS = 320;
 
 const STOP_WORDS = new Set([
@@ -83,8 +83,8 @@ export function createKnowledgePreStepHandler(
         return decision;
       }
 
-      const terms = extractTaskTerms(decision.messages);
-      if (terms.length === 0) {
+      const query = extractTaskQuery(decision.messages);
+      if (query === null) {
         return decision;
       }
 
@@ -98,7 +98,12 @@ export function createKnowledgePreStepHandler(
         }
       }
 
-      const matches = retrieveKnowledge(repository, terms, workspace, options.project)
+      const matches = retrieveRelevantKnowledge(repository, query, {
+        workspace,
+        project: options.project,
+        limit: MAX_RETRIEVAL_RESULTS,
+      })
+        .map(({ knowledge }) => knowledge)
         .filter((item) => !seenIds.has(item.id))
         .slice(0, MAX_INJECTED_KNOWLEDGE_ITEMS);
       if (matches.length === 0) {
@@ -133,7 +138,24 @@ export function createKnowledgePreStepHandler(
   };
 }
 
-/** A deliberately small keyword query over only the latest user message in the proposed step. */
+/** Returns only the latest user-authored text from the proposed step. */
+export function extractTaskQuery(messages: readonly UserMessage[]): string | null {
+  const latestUserMessage = [...messages]
+    .reverse()
+    .find((message) => message.source.kind === "user");
+  if (latestUserMessage === undefined) {
+    return null;
+  }
+
+  const query = latestUserMessage.content
+    .flatMap((block) => block.type === "text" ? [block.text] : [])
+    .join(" ")
+    .slice(0, 1_200)
+    .trim();
+  return query.length === 0 ? null : query;
+}
+
+/** @deprecated Use extractTaskQuery; retained for M1 adapter source compatibility. */
 export function extractTaskTerms(messages: readonly UserMessage[]): string[] {
   const latestUserMessage = [...messages]
     .reverse()
@@ -157,42 +179,6 @@ export function extractTaskTerms(messages: readonly UserMessage[]): string[] {
     }
   }
   return [...terms];
-}
-
-function retrieveKnowledge(
-  repository: KnowledgeRepository,
-  terms: readonly string[],
-  workspace: string,
-  project: string | undefined,
-): Knowledge[] {
-  const statuses: KnowledgeStatus[] = ["verified", "candidate"];
-  const scopes: Array<string | null> = project === undefined ? [null] : [project, null];
-  const results: Knowledge[] = [];
-  const seen = new Set<string>();
-
-  // Verified entries rank first; within a status, project-local records rank before workspace-wide records.
-  for (const status of statuses) {
-    for (const scope of scopes) {
-      for (const term of terms) {
-        const matches = repository.search(term, {
-          workspace,
-          project: scope,
-          status,
-          limit: MAX_SEARCH_CANDIDATES_PER_TERM,
-        });
-        for (const item of matches) {
-          if (!seen.has(item.id)) {
-            seen.add(item.id);
-            results.push(item);
-          }
-          if (results.length >= MAX_INJECTED_KNOWLEDGE_ITEMS) {
-            return results;
-          }
-        }
-      }
-    }
-  }
-  return results;
 }
 
 function formatKnowledgeContext(items: readonly Knowledge[]): string | undefined {

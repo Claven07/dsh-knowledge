@@ -6,7 +6,7 @@ Ordinary chat memory often retains conversational details without showing what a
 
 ## Status
 
-M0 core storage and M1 native DeepSeek Harness tools/context retrieval are implemented. **DeepSeek Harness integration was not part of M0; it is implemented as the separate `dsh-knowledge/plugin` entry point in M1.** The storage/domain API remains usable without DeepSeek Harness.
+M0 core storage, M1 native DeepSeek Harness tools, and M2 deterministic ranked retrieval are implemented. **DeepSeek Harness integration was not part of M0; it is implemented as the separate `dsh-knowledge/plugin` entry point.** The storage/domain and retrieval APIs remain usable without DeepSeek Harness.
 
 ## Capabilities
 
@@ -16,7 +16,7 @@ M0 core storage and M1 native DeepSeek Harness tools/context retrieval are imple
 - Five DSH tools: `knowledge_add`, `knowledge_search`, `knowledge_list`, `knowledge_get`, and `knowledge_archive`.
 - Session evidence on explicit tool-created items when DSH provides a calling agent/session.
 - Bounded model inputs and results; the add tool advises against persisting credentials or secrets (there is no secret scanner).
-- Bounded `agent/pre-step` retrieval from the current workspace and optional configured project. It prioritizes exact-project entries and verified status, excludes archived/superseded entries, and injects compact context only.
+- Bounded `agent/pre-step` retrieval from the current workspace and optional configured project. It ranks relevant project entries before workspace-wide entries, prefers verified entries at equal scope, excludes archived/superseded entries, suppresses conservative near-duplicates, and injects compact context only.
 - Retrieval/storage failures are logged and do not stop agent execution.
 
 There is no automatic LLM extraction, embeddings, vector search, external API, HTTP server, or UI.
@@ -65,7 +65,11 @@ The override replaces the row's full config, so include every setting you need t
 ## Core usage
 
 ```ts
-import { KnowledgeRepository, KnowledgeStore } from "dsh-knowledge";
+import {
+  KnowledgeRepository,
+  KnowledgeStore,
+  retrieveRelevantKnowledge,
+} from "dsh-knowledge";
 
 const store = new KnowledgeStore(".dsh-knowledge/knowledge.sqlite");
 const knowledge = new KnowledgeRepository(store);
@@ -89,8 +93,16 @@ const matches = knowledge.search("ResponseRouter", {
   project: "payments",
 });
 
+const ranked = retrieveRelevantKnowledge(knowledge, "provider fallback routing", {
+  workspace: "/work/payments",
+  project: "payments",
+  limit: 8,
+});
+
 store.close();
 ```
+
+`repository.search()` remains a deterministic literal `LIKE` search. The separate `retrieveRelevantKnowledge()` API performs explainable relevance ranking and returns each `Knowledge` with a score breakdown.
 
 `create()` assigns a UUID and timestamps and starts an item as `candidate`. Candidates can be verified or archived. Verified items can be archived or superseded by another verified item in the same scope; superseded items can be archived.
 
@@ -116,7 +128,31 @@ DeepSeek Harness hooks and tools
 
 The adapter gets a workspace from the active session's `header.cwd`. The project name is configured explicitly because the current Session header does not provide one. Tool calls can pass workspace/project filters. A configured project is the default exact scope; without a configured project, tools default to workspace-wide knowledge only. `knowledge_add`, `knowledge_search`, `knowledge_list`, `knowledge_get`, and `knowledge_archive` accept `project: null` to select workspace-wide scope explicitly. Tool-created knowledge uses `exec.agent.session.id` for session evidence and timestamps evidence at creation time.
 
-Before an agent request, `agent/pre-step` takes a few non-generic keywords (at most 64 characters each) from the latest user message in the proposed step and searches deterministically with the existing repository `LIKE` search. It retrieves at most four items and injects no more than 1,800 characters in a `<dsh-knowledge>` block. Stored text is quoted and labeled untrusted; directives in it should not be followed. Verified items rank ahead of candidates, and exact-project items rank ahead of workspace-wide items within each status. If no project is configured, retrieval is workspace-wide only. A session event observer remembers committed injected IDs in memory, scans a session transcript once to cover sessions present at plugin load, and releases state on session disposal; events are not stored in SQLite.
+Before an agent request, `agent/pre-step` passes the latest user-authored text in the proposed step to the core retrieval engine. It retrieves at most four items and injects no more than 1,800 characters in a `<dsh-knowledge>` block. Stored text is quoted and labeled untrusted; directives in it should not be followed. Retrieval considers candidate and verified knowledge only. If a project is configured, exact-project entries rank above workspace-wide entries when textual relevance is equal; verified entries rank above candidates at equal scope. If no project is configured, retrieval is workspace-wide only. A session event observer remembers committed injected IDs in memory, scans a session transcript once to cover sessions present at plugin load, and releases state on session disposal; events are not stored in SQLite.
+
+## Deterministic retrieval (M2)
+
+M2 uses local text and existing metadata; it does not use embeddings, an LLM, or external services. Query and content text are Unicode-normalized, lowercased, and split on punctuation. Common stopwords are ignored, and only the first 16 meaningful query tokens are scored. A normalized exact phrase match is detected in addition to exact token and conservative partial-token matches. Text with no meaningful token match is not returned.
+
+The ranking score is an integer built from fixed, centralized weights:
+
+| Dimension | Contribution |
+| --- | ---: |
+| Exact normalized phrase | 1,000 text points |
+| Exact token match | 100 text points per token |
+| Partial token match | 40 text points per token |
+| Token coverage | Up to 400 text points |
+| Exact configured project scope | 1,000 ranking points |
+| Verified status | 100 ranking points |
+| Explicit preferred type | 10 points per preference rank |
+| Evidence availability | 0–3 points |
+| Relative freshness | 1–4 points |
+
+Text points are multiplied by 10,000, so scope, verification, and metadata cannot outweigh a textual relevance point. Project scope is the next ranking dimension, then verification. Type only affects ordering when a caller explicitly supplies `preferredTypes`; no type is treated as inherently more relevant. Freshness is measured against the newest matching item in the same retrieval, so identical query/database state produces the same ranking without a wall-clock dependency. Stable timestamp and ID ordering break remaining ties.
+
+Near-duplicate suppression is deliberately conservative: records must have the same knowledge type and exact workspace/project scope, and must either normalize to the same token sequence or preserve one another's token order while sharing at least 90% of their distinct content tokens (with at least eight tokens). Reordered claims and changes to negation or modal/contrast words are retained. The higher-ranked entry is kept and lists suppressed IDs in its developer-facing explanation.
+
+Candidate collection scans active records in the explicitly selected workspace/project scopes using the existing SQLite indexes and repository API. This keeps M0 storage/search semantics unchanged and avoids a schema migration; retrieval work grows with the number of active records in those scopes.
 
 ## Current limitations
 
@@ -124,7 +160,7 @@ Before an agent request, `agent/pre-step` takes a few non-generic keywords (at m
 - Project identity must be configured; `cwd` is used as the workspace value without filesystem canonicalization.
 - Evidence references are supplied by the caller. Git evidence discovery, file validation, and provenance verification are not implemented.
 - Knowledge input is bounded through DSH tools, but the standalone M0 repository remains unbounded and neither layer scans for secrets. Do not store credentials or other sensitive values.
-- Search is literal, deterministic SQLite `LIKE` matching. It is not semantic search.
+- `repository.search()` remains literal SQLite `LIKE` matching. M2 ranked retrieval is deterministic lexical matching, not semantic search; candidate collection scans the active records in scope.
 - Knowledge is local to one SQLite database and is not synchronized.
 - Automatic knowledge extraction, stale knowledge detection, and automatic lesson generation are not implemented.
 - Adapter tests use the published DSH tool definitions and typed fixtures; they do not boot a complete DSH profile or model adapter.
@@ -133,7 +169,7 @@ Before an agent request, `agent/pre-step` takes a few non-generic keywords (at m
 
 - **M0 Core storage** — completed
 - **M1 DSH tools** — completed
-- **M2 Automatic retrieval/context injection** — implemented in M1 as bounded deterministic pre-step retrieval; future work may improve its policy
+- **M2 Intelligent deterministic retrieval** — completed; ranked local text retrieval is used by bounded pre-step context injection
 - **M3 Evidence/provenance integration** — future
 - **M4 Staleness detection** — future
 - **M5 Automatic lessons** — future

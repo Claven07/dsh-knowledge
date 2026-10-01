@@ -418,41 +418,73 @@ describe("DeepSeek Harness plugin adapters", () => {
     const repo = openRepository(harness.path);
     const projectItem = repo.create({
       type: "decision",
-      content: "ResponseRouter is the payment provider selection boundary.",
+      content: "ResponseRouter fallback is the payment provider selection boundary.",
       scope: { workspace: "C:\\workspace\\payments", project: "payments" },
     });
     repo.update(projectItem.id, { status: "verified" });
     repo.create({
       type: "lesson",
-      content: "ResponseRouter failures should preserve workspace fallbacks.",
+      content: "ResponseRouter fallback behavior is shared by all projects.",
       scope: { workspace: "C:\\workspace\\payments" },
     });
     repo.create({
       type: "fact",
-      content: "ResponseRouter for another project must stay isolated.",
+      content: "ResponseRouter fallback for another project must stay isolated.",
       scope: { workspace: "C:\\workspace\\payments", project: "identity" },
     });
 
-    const response = await runPreStep(harness, makeSession("C:\\workspace\\payments"), "Implement ResponseRouter fallback handling.");
+    const response = await runPreStep(harness, makeSession("C:\\workspace\\payments"), "ResponseRouter fallback");
     const injected = response.messages.at(-1)!;
 
     expect(injected.source.kind).toBe(KNOWLEDGE_CONTEXT_SOURCE);
-    expect(textOf(injected.content)).toContain("[DECISION] \"ResponseRouter is the payment provider selection boundary.\"");
-    expect(textOf(injected.content)).toContain("workspace fallbacks");
+    expect(textOf(injected.content)).toContain("[DECISION] \"ResponseRouter fallback is the payment provider selection boundary.\"");
+    expect(textOf(injected.content)).toContain("shared by all projects");
     expect(textOf(injected.content)).not.toContain("another project");
   });
 
-  it("ranks verified workspace knowledge above candidate project knowledge", async () => {
+  it("retrieves from the latest user-authored message in the proposed step", async () => {
+    const harness = createPluginHarness({ project: "payments" });
+    const repository = openRepository(harness.path);
+    repository.create({
+      type: "fact",
+      content: "SQLite WAL transactions are durable.",
+      scope: { workspace: "C:\\workspace\\payments", project: "payments" },
+    });
+    repository.create({
+      type: "lesson",
+      content: "ResponseRouter handles provider fallback.",
+      scope: { workspace: "C:\\workspace\\payments", project: "payments" },
+    });
+
+    const handler = harness.listeners.get("agent/pre-step")! as KnowledgePreStepHandler;
+    const original: PreStepDecision = {
+      kind: "enter",
+      messages: [makeUserMessage("Review SQLite transaction durability."), makeUserMessage("Explain ResponseRouter fallback.")],
+    };
+    const result = await handler(
+      preStepPayload(makeSession("C:\\workspace\\payments")),
+      async () => original,
+    );
+
+    expect(result.kind).toBe("enter");
+    if (result.kind === "enter") {
+      const context = textOf(result.messages.at(-1)!.content);
+      expect(context).toContain("ResponseRouter handles provider fallback");
+      expect(context).not.toContain("SQLite WAL transactions");
+    }
+  });
+
+  it("ranks project knowledge above workspace knowledge when text relevance matches", async () => {
     const harness = createPluginHarness({ project: "payments" });
     const repo = openRepository(harness.path);
     repo.create({
       type: "fact",
-      content: "ResponseRouter candidate project guidance.",
+      content: "ResponseRouter guidance for payment fallback.",
       scope: { workspace: "C:\\workspace\\payments", project: "payments" },
     });
     const sharedVerified = repo.create({
       type: "decision",
-      content: "ResponseRouter verified workspace rule.",
+      content: "ResponseRouter guidance for workspace fallback.",
       scope: { workspace: "C:\\workspace\\payments" },
     });
     repo.update(sharedVerified.id, { status: "verified" });
@@ -464,8 +496,8 @@ describe("DeepSeek Harness plugin adapters", () => {
     );
     const context = textOf(response.messages.at(-1)!.content);
 
-    expect(context.indexOf("verified workspace rule")).toBeLessThan(
-      context.indexOf("candidate project guidance"),
+    expect(context.indexOf("guidance for payment fallback")).toBeLessThan(
+      context.indexOf("guidance for workspace fallback"),
     );
   });
 
@@ -660,7 +692,7 @@ describe("DeepSeek Harness plugin adapters", () => {
     const warnings: unknown[] = [];
     const tracker = new KnowledgeInjectionTracker();
     const brokenRepository = {
-      search: () => {
+      list: () => {
         throw new Error("database read failed");
       },
     } as unknown as KnowledgeRepository;
