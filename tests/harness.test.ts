@@ -13,6 +13,7 @@ import {
 import type { Session, SessionEvent } from "@deepseek-ai/dsh-session";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KnowledgeRepository } from "../src/knowledge/repository.js";
+import { retrieveRelevantKnowledge } from "../src/knowledge/retrieval.js";
 import { KnowledgeStore } from "../src/knowledge/store.js";
 import type { Knowledge, KnowledgeType } from "../src/knowledge/types.js";
 import { KnowledgeInjectionTracker, KNOWLEDGE_CONTEXT_SOURCE } from "../src/harness/events.js";
@@ -353,6 +354,41 @@ describe("DeepSeek Harness plugin adapters", () => {
     ]);
     expect(result.provenanceCapture).toMatchObject({ attempted: 1, captured: 0, skipped: 1 });
     expect(Date.parse(stored!.evidence[0]!.timestamp)).not.toBeNaN();
+  });
+
+  it.each([
+    { label: "API key", secret: "ghp_123456789012345678901234567890123456" },
+    { label: "bearer token", secret: `Bearer ${"A".repeat(32)}` },
+    { label: "JWT", secret: `eyJ${"A".repeat(16)}.${"B".repeat(16)}.${"C".repeat(16)}` },
+    { label: "password assignment", secret: "password=hunter2" },
+    { label: "credential assignment", secret: "credential=synthetic-test-value" },
+    { label: "private-key marker", secret: "-----BEGIN PRIVATE KEY-----" },
+  ])("rejects a model-facing knowledge_add containing a synthetic $label without persistence or leakage", async ({ secret }) => {
+    const harness = createPluginHarness({ project: "payments" });
+    const content = `Use this deployment setting: ${secret}`;
+    let rejection: unknown;
+    try {
+      await harness.invoke("knowledge_add", {
+        type: "fact",
+        content,
+        workspace: "C:\\workspace\\payments",
+      }, makeSession("C:\\workspace\\payments"));
+    } catch (error: unknown) {
+      rejection = error;
+    }
+
+    expect(rejection).toBeInstanceOf(Error);
+    const errorMessage = rejection instanceof Error ? rejection.message : String(rejection);
+    expect(errorMessage).toBe("knowledge content rejected by privacy policy");
+    expect(errorMessage.includes(secret)).toBe(false);
+    expect(harness.warnings.some((warning) => warning.includes(secret))).toBe(false);
+
+    const repository = openRepository(harness.path);
+    expect(repository.list({ workspace: "C:\\workspace\\payments", project: "payments" })).toEqual([]);
+    expect(retrieveRelevantKnowledge(repository, "deployment setting", {
+      workspace: "C:\\workspace\\payments",
+      project: "payments",
+    })).toEqual([]);
   });
 
   it("knowledge_add preserves caller evidence and avoids duplicate current-session evidence", async () => {

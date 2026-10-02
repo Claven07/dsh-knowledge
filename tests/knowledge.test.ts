@@ -290,6 +290,51 @@ describe("KnowledgeRepository", () => {
       expect(() => repository.supersede(original.id, otherScope.id)).toThrow(/same workspace and project/);
       expect(() => repository.supersede(original.id, original.id)).toThrow(/cannot supersede itself/);
     });
+
+    it("preserves replacement scope integrity while allowing unlinked scope changes", () => {
+      const original = repository.create(input({ content: "Original scoped decision." }));
+      const replacement = repository.create(input({ content: "Replacement scoped decision." }));
+      repository.update(original.id, { status: "verified" });
+      repository.update(replacement.id, { status: "verified" });
+
+      expect(repository.supersede(original.id, replacement.id).status).toBe("superseded");
+      const relation = (): { replacement_id: string | null } | undefined =>
+        store.database.prepare("SELECT replacement_id FROM knowledge WHERE id = ?").get(original.id) as
+          { replacement_id: string | null } | undefined;
+      expect(relation()?.replacement_id).toBe(replacement.id);
+
+      expect(() => repository.update(replacement.id, {
+        scope: { workspace: "workspace-b", project: "project-a" },
+      })).toThrow(/scope of knowledge participating in a replacement relationship/);
+      expect(() => repository.update(replacement.id, {
+        scope: { workspace: "workspace-a", project: "project-b" },
+      })).toThrow(/scope of knowledge participating in a replacement relationship/);
+      expect(() => repository.update(original.id, {
+        scope: { workspace: "workspace-b", project: "project-a" },
+      })).toThrow(/scope of knowledge participating in a replacement relationship/);
+      expect(() => repository.update(original.id, {
+        scope: { workspace: "workspace-a", project: "project-b" },
+      })).toThrow(/scope of knowledge participating in a replacement relationship/);
+
+      expect(relation()?.replacement_id).toBe(replacement.id);
+      expect(repository.getById(original.id)?.scope).toEqual({
+        workspace: "workspace-a",
+        project: "project-a",
+      });
+      expect(repository.getById(replacement.id)?.scope).toEqual({
+        workspace: "workspace-a",
+        project: "project-a",
+      });
+
+      const unlinked = repository.create(input({ content: "Unlinked item may move." }));
+      expect(repository.update(unlinked.id, {
+        scope: { workspace: "workspace-b", project: "project-b" },
+      }).scope).toEqual({ workspace: "workspace-b", project: "project-b" });
+
+      expect(repository.getById(original.id)?.status).toBe("superseded");
+      expect(repository.getById(replacement.id)?.status).toBe("verified");
+      expect(repository.archive(original.id).status).toBe("archived");
+    });
   });
 
   it("persists knowledge and evidence after closing and reopening the database", () => {

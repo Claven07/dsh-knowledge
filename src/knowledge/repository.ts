@@ -188,6 +188,12 @@ export class KnowledgeRepository {
       if (!isValidTransition(current.status, status)) {
         throw invalidTransition(current.status, status);
       }
+      const scopeChanged =
+        current.scope.workspace !== scope.workspace ||
+        (current.scope.project ?? null) !== (scope.project ?? null);
+      if (scopeChanged && this.hasReplacementRelationship(id)) {
+        throw new Error("Cannot change the scope of knowledge participating in a replacement relationship.");
+      }
       const evidence = patch.evidence === undefined ? undefined : normalizeEvidence(patch.evidence);
       const updatedAt = nextTimestamp(current.updatedAt);
 
@@ -279,6 +285,16 @@ export class KnowledgeRepository {
       throw new Error(`Knowledge item not found: ${id}`);
     }
     return item;
+  }
+
+  private hasReplacementRelationship(id: string): boolean {
+    return this.database
+      .prepare(
+        `SELECT 1 FROM knowledge
+         WHERE (id = ? AND replacement_id IS NOT NULL) OR replacement_id = ?
+         LIMIT 1`,
+      )
+      .get(id, id) !== undefined;
   }
 }
 

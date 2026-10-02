@@ -1,6 +1,7 @@
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { InferValue, ToolRuntime, ToolRunContext } from "@deepseek-ai/dsh-tools";
 import type { KnowledgeRepository } from "../knowledge/repository.js";
+import { containsSensitiveContent } from "../knowledge/extraction.js";
 import { captureFileProvenance, MAX_GIT_EVIDENCE_CHECKS } from "../knowledge/git.js";
 import { checkKnowledgeFreshness } from "../knowledge/freshness.js";
 import type {
@@ -247,6 +248,9 @@ export function registerKnowledgeTools(
       }
 
       validateBoundedText(args.content, "content", MAX_CONTENT_CHARS);
+      if (containsSensitiveContent(args.content)) {
+        throw new Error("knowledge content rejected by privacy policy");
+      }
       validateBoundedText(args.workspace, "workspace", MAX_WORKSPACE_CHARS);
       validateEvidence(args.evidence ?? []);
 
