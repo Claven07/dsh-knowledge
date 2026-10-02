@@ -253,6 +253,12 @@ export function registerKnowledgeTools(
       }
       validateBoundedText(args.workspace, "workspace", MAX_WORKSPACE_CHARS);
       validateEvidence(args.evidence ?? []);
+      if ((args.evidence ?? []).some(({ source, locator }) =>
+        containsSensitiveContent(source) ||
+        (locator !== undefined && containsSensitiveContent(locator))
+      )) {
+        throw new Error("knowledge content rejected by privacy policy");
+      }
 
       const createdAt = new Date().toISOString();
       const capture: {

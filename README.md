@@ -2,7 +2,7 @@
 
 `dsh-knowledge` is a local, evidence-backed project knowledge layer for coding agents. It stores durable project facts, engineering decisions, and lessons in SQLite, with explicit workspace/project scope and lifecycle status.
 
-Ordinary chat memory often retains conversational details without showing what a statement describes or where it came from. `dsh-knowledge` keeps evidence as first-class records so future integrations can connect knowledge to sessions, files, and Git history. Evidence is caller-supplied in M0/M1; automatic discovery is not implemented.
+Ordinary chat memory often retains conversational details without showing what a statement describes or where it came from. `dsh-knowledge` keeps evidence as first-class records. Explicit entries use caller-supplied evidence; opt-in M4 extraction attaches bounded session evidence to automatic candidates.
 
 ## Status
 
@@ -17,7 +17,7 @@ M0 core storage, M1 native DeepSeek Harness tools, M2 deterministic ranked retri
 - `knowledge_add` opportunistically attaches the current commit and repository-relative path to clean, committed file evidence in the active session workspace.
 - `knowledge_check_freshness` compares Git-backed file evidence with the current repository snapshot without modifying knowledge or Git state.
 - Session evidence on explicit tool-created items when DSH provides a calling agent/session.
-- Bounded model inputs and results; the add tool advises against persisting credentials or secrets (there is no secret scanner).
+- The model-facing `knowledge_add` tool filters common secret patterns in content and evidence source/locator fields; this is not comprehensive scanning, and the trusted core repository does not scan secrets.
 - Bounded `agent/pre-step` retrieval from the current workspace and optional configured project. It ranks relevant project entries before workspace-wide entries, prefers verified entries at equal scope, excludes archived/superseded entries, suppresses conservative near-duplicates, and injects compact context only.
 - Retrieval/storage failures are logged and do not stop agent execution.
 
@@ -192,7 +192,7 @@ Candidate collection scans active records in the explicitly selected workspace/p
 - Freshness is a bounded, on-demand snapshot comparison, not continuous monitoring. It compares committed snapshots and the current worktree; it does not detect every historical edit that was later reverted.
 - Git may not safely compare files with configured clean/process filters, symlinked path components, or index flags such as `assume-unchanged` and `skip-worktree`; those checks return `unverifiable`. Provenance capture also requires an ordinary tracked worktree file and an index entry with no hidden-state flags.
 - No Git network operations are performed. Missing objects are reported as unverifiable rather than fetched.
-- Explicit knowledge input through the repository or Harness tools is not secret-scanned. The M4 filter applies only to automatic candidates and recognizes common formats; it cannot guarantee detection of every sensitive or personal value. Do not store credentials or other sensitive values.
+- The model-facing Harness `knowledge_add` tool filters common secret patterns in content and evidence source/locator fields. The lower-level trusted repository API does not scan secrets; the Harness filter is not comprehensive and cannot guarantee detection of every sensitive or personal value. Do not store credentials or other sensitive values.
 - `repository.search()` remains literal SQLite `LIKE` matching. M2 ranked retrieval is deterministic lexical matching, not semantic search; candidate collection scans the active records in scope.
 - Knowledge is local to one SQLite database and is not synchronized.
 - Continuous stale-knowledge monitoring and a dedicated candidate review/verification workflow are not implemented.

@@ -391,6 +391,85 @@ describe("DeepSeek Harness plugin adapters", () => {
     })).toEqual([]);
   });
 
+  const sensitiveEvidenceValues = [
+    { label: "API key", value: "ghp_123456789012345678901234567890123456" },
+    { label: "bearer token", value: `Bearer ${"A".repeat(32)}` },
+    { label: "JWT", value: `eyJ${"A".repeat(16)}.${"B".repeat(16)}.${"C".repeat(16)}` },
+    { label: "password assignment", value: "password=synthetic-test-value" },
+    { label: "credential assignment", value: "credential=synthetic-test-value" },
+    { label: "private-key marker", value: "-----BEGIN PRIVATE KEY-----" },
+  ];
+  const sensitiveEvidenceCases = sensitiveEvidenceValues.flatMap(({ label, value }) =>
+    (["source", "locator"] as const).map((field) => ({ label, secret: value, field }))
+  );
+
+  it.each(sensitiveEvidenceCases)(
+    "rejects a synthetic $label in evidence.$field before persistence or leakage",
+    async ({ secret, field }) => {
+      const harness = createPluginHarness({ project: "payments" });
+      const evidence = {
+        type: "session",
+        source: field === "source" ? secret : "safe-session-source",
+        ...(field === "locator" ? { locator: secret } : {}),
+      };
+      let rejection: unknown;
+      try {
+        await harness.invoke("knowledge_add", {
+          type: "fact",
+          content: "Use the documented deployment configuration.",
+          workspace: "C:\\workspace\\payments",
+          evidence: [evidence],
+        }, makeSession("C:\\workspace\\payments"));
+      } catch (error: unknown) {
+        rejection = error;
+      }
+
+      expect(rejection).toBeInstanceOf(Error);
+      const errorMessage = rejection instanceof Error ? rejection.message : String(rejection);
+      expect(errorMessage).toBe("knowledge content rejected by privacy policy");
+      expect(errorMessage).not.toContain(secret);
+      expect(harness.warnings.join(" ")).not.toContain(secret);
+
+      const store = new KnowledgeStore(harness.path);
+      activeStores.push(store);
+      const repository = new KnowledgeRepository(store);
+      expect(repository.list({ workspace: "C:\\workspace\\payments", project: "payments" })).toEqual([]);
+      const evidenceCount = store.database
+        .prepare("SELECT COUNT(*) AS count FROM knowledge_evidence")
+        .get() as { count: number };
+      expect(evidenceCount.count).toBe(0);
+      const get = await harness.invoke("knowledge_get", {
+        id: "not-created-by-rejected-add",
+        workspace: "C:\\workspace\\payments",
+        project: "payments",
+      }) as ToolItemResult;
+      expect(get).toEqual({ ok: true, item: null });
+      expect(JSON.stringify({ errorMessage, warnings: harness.warnings, get })).not.toContain(secret);
+    },
+  );
+
+  it("accepts and returns clean model-facing evidence", async () => {
+    const harness = createPluginHarness({ project: "payments" });
+    const added = await harness.invoke("knowledge_add", {
+      type: "fact",
+      content: "The project deployment uses the documented release process.",
+      workspace: "C:\\workspace\\payments",
+      evidence: [{ type: "session", source: "session-1", locator: "seq=42" }],
+    }, makeSession("C:\\workspace\\payments")) as ToolItemResult;
+
+    expect(added.ok).toBe(true);
+    const fetched = await harness.invoke("knowledge_get", {
+      id: added.item!.id,
+      workspace: "C:\\workspace\\payments",
+      project: "payments",
+    }) as ToolItemResult;
+    expect(fetched.item?.evidence).toEqual([
+      { type: "session", source: "session-1", locator: "seq=42" },
+    ]);
+    expect(openRepository(harness.path).getById(added.item!.id)?.evidence[0]?.timestamp)
+      .toEqual(expect.any(String));
+  });
+
   it("knowledge_add preserves caller evidence and avoids duplicate current-session evidence", async () => {
     const harness = createPluginHarness();
     const session = makeSession("C:\\workspace\\payments");
