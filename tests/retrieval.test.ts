@@ -198,13 +198,21 @@ describe("deterministic knowledge retrieval", () => {
         }],
       });
 
+      const before = retrieve("ResponseRouter policy authorization").map(({ knowledge, score }) => ({
+        id: knowledge.id,
+        score,
+      }));
       const health = await checkKnowledgeHealth(item, {
         workspaceDirectory: gitRepository.directory,
       });
-      const ranked = retrieve("ResponseRouter policy authorization");
+      const after = retrieve("ResponseRouter policy authorization").map(({ knowledge, score }) => ({
+        id: knowledge.id,
+        score,
+      }));
 
       expect(health.status).toBe("potentially_stale");
-      expect(ranked.map(({ knowledge }) => knowledge.id)).toContain(item.id);
+      expect(after).toEqual(before);
+      expect(after.map(({ id }) => id)).toContain(item.id);
     } finally {
       gitRepository.cleanup();
     }

@@ -229,6 +229,33 @@ const healthOutputSchema = {
   ],
 } as const;
 
+const getOutputSchema = {
+  oneOf: [
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ok: { type: "boolean", const: true, required: true },
+        item: {
+          oneOf: [knowledgeSummarySchema, { type: "null" }],
+          required: true,
+        },
+        health: {
+          oneOf: [healthReportOutputSchema, { type: "null" }],
+        },
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ok: { type: "boolean", const: false, required: true },
+        error: { type: "string", required: true },
+      },
+    },
+  ],
+} as const;
+
 const listOutputSchema = {
   oneOf: [
     {
@@ -526,7 +553,7 @@ export function registerKnowledgeTools(
 
   const getTool = defineTool({
     name: "knowledge_get",
-    description: "Get one knowledge item by ID within the current or explicitly selected workspace.",
+    description: "Get one knowledge item by ID within the current or explicitly selected workspace. Set includeHealth to true for an explicit, observational live health check in the active session workspace and configured project.",
     parameters: {
       id: { type: "string", required: true, description: "Knowledge ID." },
       workspace: { type: "string", description: "Workspace filter; defaults to the active session cwd." },
@@ -534,9 +561,13 @@ export function registerKnowledgeTools(
         oneOf: [{ type: "string" }, { type: "null" }],
         description: "Exact project filter; omit for the configured project (or workspace-wide if none is configured); use null to select workspace-wide scope explicitly.",
       },
+      includeHealth: {
+        type: "boolean",
+        description: "Opt in to a bounded live health inspection. Omitted or false performs no health or Git work.",
+      },
     },
     output: {
-      schema: singleItemOutputSchema,
+      schema: getOutputSchema,
       render: (_args, value) => [
         { type: "text", text: renderJson(value) },
       ],
@@ -552,10 +583,41 @@ export function registerKnowledgeTools(
       }
       validateBoundedText(args.id, "id", MAX_ID_CHARS);
       const item = repository.getById(args.id);
-      if (!isInScope(item, workspace, resolveProject(args.project, config.project))) {
-        return { ok: true, item: null };
+      const requestedProject = resolveProject(args.project, config.project);
+      if (!isInScope(item, workspace, requestedProject)) {
+        return args.includeHealth === true
+          ? { ok: true, item: null, health: null }
+          : { ok: true, item: null };
       }
-      return { ok: true, item: item === null ? null : summarize(item, GET_CONTENT_LIMIT, true) };
+
+      const summarizedItem = summarize(item, GET_CONTENT_LIMIT, true);
+      if (args.includeHealth !== true) {
+        return { ok: true, item: summarizedItem };
+      }
+
+      const sessionWorkspace = resolveWorkspace(undefined, exec);
+      const healthProject = resolveProject(undefined, config.project);
+      if (
+        sessionWorkspace === undefined ||
+        !isInScope(item, sessionWorkspace, healthProject)
+      ) {
+        return { ok: true, item: summarizedItem, health: null };
+      }
+
+      const batch = await healthGate.run(
+        exec.signal,
+        (signal) => checkKnowledgeHealthBatch([item], {
+          workspaceDirectory: sessionWorkspace,
+          signal,
+        }),
+        () => null,
+      );
+      const report = batch?.results[0] ?? makeBusyKnowledgeHealth(item);
+      return {
+        ok: true,
+        item: summarizedItem,
+        health: summarizeHealth(report, item.status, item.creationOrigin),
+      };
     },
   });
 
