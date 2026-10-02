@@ -2,12 +2,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   KnowledgeRepository,
   KnowledgeStore,
+  checkKnowledgeHealth,
   MAX_RETRIEVAL_RESULTS,
   RETRIEVAL_SCORING,
   retrieveRelevantKnowledge,
   type CreateKnowledgeInput,
   type Knowledge,
 } from "../src/index.js";
+import { createTemporaryGitRepository, initializeGitRepository } from "./git-fixtures.js";
 
 const timestamp = "2026-10-01T10:00:00.000Z";
 
@@ -179,6 +181,34 @@ describe("deterministic knowledge retrieval", () => {
 
     expect(retrieve("ResponseRouter fallback guidance")).toEqual([]);
   });
+
+  it("does not change M2 eligibility when Git-backed knowledge may be stale", async () => {
+    const gitRepository = createTemporaryGitRepository("dsh-knowledge-retrieval-health-");
+    try {
+      await initializeGitRepository(gitRepository.directory);
+      gitRepository.write("src/policy.ts", "original policy\n");
+      const commit = await gitRepository.commit("initial policy");
+      gitRepository.write("src/policy.ts", "changed policy\n");
+      const item = create("ResponseRouter policy keeps authorization scoped.", {
+        evidence: [{
+          type: "file",
+          source: "src/policy.ts",
+          timestamp,
+          gitProvenance: { commit, path: "src/policy.ts" },
+        }],
+      });
+
+      const health = await checkKnowledgeHealth(item, {
+        workspaceDirectory: gitRepository.directory,
+      });
+      const ranked = retrieve("ResponseRouter policy authorization");
+
+      expect(health.status).toBe("potentially_stale");
+      expect(ranked.map(({ knowledge }) => knowledge.id)).toContain(item.id);
+    } finally {
+      gitRepository.cleanup();
+    }
+  }, 20_000);
 
   it("uses recency only after textual relevance and other ranking dimensions", () => {
     const olderStrongMatch = create("Router fallback handles provider retries safely.");

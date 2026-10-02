@@ -125,6 +125,10 @@ The Harness `knowledge_add` tool attempts capture for explicit file evidence onl
 
 The aggregate status describes Git-backed file evidence. Session evidence does not count as proof of file freshness, and legacy file evidence without Git provenance is reported as unverifiable. A restored file snapshot can be current even if Git history contains an intermediate edit. Freshness never changes candidate, verified, superseded, or archived status and does not prove a claim true or false. Checks are bounded, do not return diffs/source contents, do not follow renames, and never fetch missing objects.
 
+## Knowledge health (M5)
+
+`checkKnowledgeHealth()` and `checkKnowledgeHealthBatch()` summarize the same M3 Git comparison results; the `knowledge_health` tool checks 1–16 IDs in the active workspace/project. Checks are explicit foreground operations against live repository state. Health is not persisted or cached, and never verifies, archives, supersedes, deletes, or edits knowledge. `current` means checkable Git-backed file snapshots match; it does not mean the claim is verified or true. Session-only automatic candidates therefore report `unverifiable` without Git-backed file evidence. Health returns at most 16 per-evidence details per item; additional evidence is counted in `overflowCount` and makes the result `unverifiable` unless stale evidence takes precedence. The existing `checkKnowledgeFreshness()` API and `knowledge_check_freshness` tool remain available for compatibility.
+
 ## DSH architecture
 
 ```text
@@ -133,7 +137,7 @@ DeepSeek Harness hooks and tools
             ├── session/event ── injection-ID deduplication
             ├── session/event + turn boundaries ── bounded candidate extraction (opt-in)
             ├── agent/pre-step ─ retrieval and compact context
-            └── ctx.tools.register() ─ model-facing knowledge tools and freshness check
+            └── ctx.tools.register() ─ model-facing knowledge tools, freshness, and health checks
                                   │
                        DSH adapter package
                                   │
@@ -205,7 +209,7 @@ Candidate collection scans active records in the explicitly selected workspace/p
 - **M2 Intelligent deterministic retrieval** — completed; ranked local text retrieval is used by bounded pre-step context injection
 - **M3 Git-aware provenance and on-demand freshness** — completed
 - **M4 Automatic knowledge and lesson candidate extraction** — implemented; opt-in and candidate-only
-- **M5 Automatic staleness monitoring** — future; M3 freshness checks remain explicit and read-only
+- **M5 Knowledge health and staleness visibility** — explicit, bounded, live Git checks; no background monitoring or lifecycle changes
 - **M6 Candidate review workflow and richer Git-aware knowledge** — future
 
 Future work includes continuous stale-knowledge monitoring and a dedicated candidate review workflow. These are not current capabilities.

@@ -15,6 +15,11 @@ export {
 } from "./knowledge/git.js";
 export { checkKnowledgeFreshness } from "./knowledge/freshness.js";
 export {
+  checkKnowledgeHealth,
+  checkKnowledgeHealthBatch,
+  MAX_HEALTH_BATCH_ITEMS,
+} from "./knowledge/health.js";
+export {
   MAX_RETRIEVAL_RESULTS,
   RETRIEVAL_SCORING,
   retrieveRelevantKnowledge,
@@ -64,6 +69,15 @@ export type {
   FreshnessStatus,
   KnowledgeFreshnessReport,
 } from "./knowledge/freshness.js";
+
+export type {
+  CheckKnowledgeHealthOptions,
+  EvidenceHealth,
+  HealthReason,
+  KnowledgeHealth,
+  KnowledgeHealthBatchReport,
+  KnowledgeHealthStatus,
+} from "./knowledge/health.js";
 
 export type {
   KnowledgeMatchType,

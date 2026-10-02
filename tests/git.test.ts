@@ -1,16 +1,25 @@
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
+import {
+  checkKnowledgeFreshness,
+  checkKnowledgeHealth,
+  compareFileSnapshots,
+} from "../src/index.js";
+import type {
+  FileProvenanceCapture,
+  FileSnapshotComparison,
+  FreshnessReason,
+  GitOperationReason,
+} from "../src/index.js";
 import {
   captureFileProvenance,
-  compareFileSnapshots,
   normalizeGitCommit,
   normalizeRepositoryRelativePath,
   type GitCommandRunner,
 } from "../src/knowledge/git.js";
-import { checkKnowledgeFreshness } from "../src/knowledge/freshness.js";
 import type { Knowledge } from "../src/knowledge/types.js";
 import { createTemporaryGitRepository, initializeGitRepository, runGit } from "./git-fixtures.js";
 
@@ -383,6 +392,15 @@ describe("Git provenance capture", () => {
 });
 
 describe("Git-backed freshness", () => {
+  it("keeps the M5 missing-path reason out of existing public M3 result types", () => {
+    expectTypeOf<Extract<GitOperationReason, "source_path_missing">>().toEqualTypeOf<never>();
+    expectTypeOf<Extract<NonNullable<FileSnapshotComparison["reason"]>, "source_path_missing">>()
+      .toEqualTypeOf<never>();
+    expectTypeOf<Extract<FreshnessReason, "source_path_missing">>().toEqualTypeOf<never>();
+    type CaptureSkippedReason = Extract<FileProvenanceCapture, { status: "skipped" }>["reason"];
+    expectTypeOf<Extract<CaptureSkippedReason, "source_path_missing">>().toEqualTypeOf<never>();
+  });
+
   it("marks an unchanged snapshot current", async () => {
     const repository = await newRepository();
     const commit = (await repository.git(["rev-parse", "HEAD"])).trim();
@@ -423,6 +441,104 @@ describe("Git-backed freshness", () => {
     expect(report.status).toBe("potentially_stale");
     expect(report.evidence[0]?.status).toBe("potentially_stale");
   });
+
+  it("preserves the M3 changed-path reason without resolving a rename", async () => {
+    const repository = await newRepository();
+    const commit = (await repository.git(["rev-parse", "HEAD"])).trim();
+    renameSync(
+      join(repository.directory, "src", "policy.ts"),
+      join(repository.directory, "src", "authorization.ts"),
+    );
+
+    const report = await checkKnowledgeFreshness(
+      knowledge(repository.directory, [fileEvidence(commit)]),
+      { workspaceDirectory: repository.directory },
+    );
+
+    expect(report.status).toBe("potentially_stale");
+    expect(report.evidence[0]).toMatchObject({
+      status: "potentially_stale",
+      reason: "working_tree_changed",
+    });
+  });
+
+  it("keeps a missing path compatible for M3 APIs while M5 reports the specific condition", async () => {
+    const repository = await newRepository();
+    const commit = (await repository.git(["rev-parse", "HEAD"])).trim();
+    const evidence = fileEvidence(commit);
+    unlinkSync(join(repository.directory, "src", "policy.ts"));
+
+    const comparison = await compareFileSnapshots({
+      workspaceDirectory: repository.directory,
+      provenances: [evidence.gitProvenance],
+    });
+    const m3 = await checkKnowledgeFreshness(
+      knowledge(repository.directory, [evidence]),
+      { workspaceDirectory: repository.directory },
+    );
+    const m5 = await checkKnowledgeHealth(
+      knowledge(repository.directory, [evidence]),
+      { workspaceDirectory: repository.directory },
+    );
+
+    expect(comparison[0]).toMatchObject({
+      status: "potentially_stale",
+      reason: "working_tree_changed",
+    });
+    expect(m3.evidence[0]).toMatchObject({
+      status: "potentially_stale",
+      reason: "working_tree_changed",
+    });
+    expect(m5.evidence[0]).toMatchObject({
+      status: "potentially_stale",
+      reason: "source_path_missing",
+    });
+  });
+
+  it("reports a retained file removed from the index as changed rather than missing", async () => {
+    const repository = createTemporaryGitRepository();
+    repositories.push(repository);
+    await initializeGitRepository(repository.directory);
+    const path = "policy.ts";
+    const content = "export const policy = 'allow';\n";
+    repository.write(path, content);
+    const commit = await repository.commit("initial policy");
+    const capture = await captureFileProvenance({
+      workspaceDirectory: repository.directory,
+      filePath: path,
+    });
+    expect(capture).toEqual({ status: "captured", provenance: { commit, path } });
+    if (capture.status !== "captured") throw new Error("Fixture provenance was not captured.");
+
+    await repository.git(["rm", "--cached", "--", path]);
+    expect(readFileSync(join(repository.directory, path), "utf8")).toBe(content);
+    expect(await repository.git(["ls-files", "--", path])).toBe("");
+
+    const evidence = fileEvidence(capture.provenance.commit, capture.provenance.path);
+    const item = knowledge(repository.directory, [evidence]);
+    const comparison = await compareFileSnapshots({
+      workspaceDirectory: repository.directory,
+      provenances: [capture.provenance],
+    });
+    const freshness = await checkKnowledgeFreshness(item, { workspaceDirectory: repository.directory });
+    const health = await checkKnowledgeHealth(item, { workspaceDirectory: repository.directory });
+
+    expect(comparison[0]).toEqual({ status: "potentially_stale", reason: "working_tree_changed" });
+    for (const report of [freshness, health]) {
+      expect(report.status).toBe("potentially_stale");
+      expect(report.evidence[0]).toMatchObject({
+        status: "potentially_stale",
+        reason: "working_tree_changed",
+      });
+    }
+    expect(health.reasons).toEqual(["working_tree_changed"]);
+
+    unlinkSync(join(repository.directory, path));
+    const deletedHealth = await checkKnowledgeHealth(item, { workspaceDirectory: repository.directory });
+    expect(deletedHealth.status).toBe("potentially_stale");
+    expect(deletedHealth.evidence[0]?.reason).toBe("source_path_missing");
+    expect(deletedHealth.reasons).toEqual(["source_path_missing"]);
+  }, 20_000);
 
   it("marks an exactly restored source snapshot current", async () => {
     const repository = await newRepository();
@@ -472,6 +588,25 @@ describe("Git-backed freshness", () => {
     );
     expect(report.status).toBe("unverifiable");
     expect(report.evidence[0]?.status).toBe("unverifiable");
+  });
+
+  it("propagates caller cancellation through the Git runner", async () => {
+    const repository = await newRepository();
+    const controller = new AbortController();
+    const runner: GitCommandRunner = {
+      run: vi.fn(async (_cwd, _args, _timeout, signal) => {
+        expect(signal).toBe(controller.signal);
+        return { exitCode: null, stdout: "", failure: "cancelled" as const };
+      }),
+    };
+
+    const report = await checkKnowledgeFreshness(
+      knowledge(repository.directory, [fileEvidence("a".repeat(40))]),
+      { workspaceDirectory: repository.directory, runner, signal: controller.signal },
+    );
+
+    expect(report.status).toBe("unverifiable");
+    expect(report.evidence[0]).toMatchObject({ status: "unverifiable", reason: "cancelled" });
   });
 
   it("handles malformed Git output and bounds evidence checks", async () => {

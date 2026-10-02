@@ -4,6 +4,13 @@ import type { KnowledgeRepository } from "../knowledge/repository.js";
 import { containsSensitiveContent } from "../knowledge/extraction.js";
 import { captureFileProvenance, MAX_GIT_EVIDENCE_CHECKS } from "../knowledge/git.js";
 import { checkKnowledgeFreshness } from "../knowledge/freshness.js";
+import {
+  checkKnowledgeHealthBatch,
+  makeBusyKnowledgeHealth,
+  MAX_HEALTH_BATCH_ITEMS,
+} from "../knowledge/health.js";
+import type { KnowledgeHealth } from "../knowledge/health.js";
+import { HarnessHealthRequestGate } from "./health-gate.js";
 import type {
   Evidence,
   EvidenceType,
@@ -161,6 +168,67 @@ const freshnessOutputSchema = {
   ],
 } as const;
 
+const healthEvidenceOutputSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    evidenceIndex: { type: "integer", required: true },
+    status: { type: "string", enum: ["current", "potentially_stale", "unverifiable"], required: true },
+    reason: { type: "string", required: true },
+  },
+} as const;
+
+const healthReportOutputSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    knowledgeStatus: { type: "string", enum: KNOWLEDGE_STATUSES, required: true },
+    creationOrigin: { type: "string", enum: KNOWLEDGE_ORIGINS, required: true },
+    checkedAt: { type: "string", required: true },
+    status: { type: "string", enum: ["current", "potentially_stale", "unverifiable"], required: true },
+    reasons: { type: "array", items: { type: "string" }, required: true },
+    evidenceCount: { type: "integer", required: true },
+    evidenceTruncated: { type: "boolean", required: true },
+    overflowCount: { type: "integer", required: true },
+    evidence: { type: "array", items: healthEvidenceOutputSchema, required: true },
+  },
+} as const;
+
+const healthOutputSchema = {
+  oneOf: [
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ok: { type: "boolean", const: true, required: true },
+        results: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              id: { type: "string", required: true },
+              health: {
+                oneOf: [healthReportOutputSchema, { type: "null" }],
+                required: true,
+              },
+            },
+          },
+          required: true,
+        },
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ok: { type: "boolean", const: false, required: true },
+        error: { type: "string", required: true },
+      },
+    },
+  ],
+} as const;
+
 const listOutputSchema = {
   oneOf: [
     {
@@ -196,7 +264,8 @@ export function registerKnowledgeTools(
   tools: KnowledgeToolRegistrar,
   getRepository: KnowledgeRepositoryProvider,
   config: KnowledgeToolConfig,
-): void {
+): () => Promise<void> {
+  const healthGate = new HarnessHealthRequestGate();
   const addTool = defineTool({
     name: "knowledge_add",
     description: "Store one project fact, engineering decision, or lesson with optional evidence.",
@@ -574,9 +643,125 @@ export function registerKnowledgeTools(
     },
   });
 
-  for (const tool of [addTool, searchTool, listTool, getTool, archiveTool, freshnessTool]) {
+  const healthTool = defineTool({
+    name: "knowledge_health",
+    description: "Check live Git evidence health for up to 16 knowledge items in the active workspace and configured project. This foreground check is read-only and does not change lifecycle status.",
+    parameters: {
+      ids: {
+        type: "array",
+        required: true,
+        description: `Knowledge IDs to check (1–${MAX_HEALTH_BATCH_ITEMS}); use IDs from knowledge_list.`,
+        items: { type: "string" },
+      },
+    },
+    output: {
+      schema: healthOutputSchema,
+      render: (_args, value) => [
+        { type: "text", text: renderJson(value) },
+      ],
+    },
+    async execute(args, exec) {
+      const repository = getRepository();
+      if (repository === null) {
+        return unavailable();
+      }
+      const ids = validateHealthIds(args.ids);
+      const workspace = resolveWorkspace(undefined, exec);
+      if (workspace === undefined) {
+        return missingWorkspace();
+      }
+
+      const scopedById = new Map<string, Knowledge>();
+      const project = resolveProject(undefined, config.project);
+      for (const id of new Set(ids)) {
+        const item = repository.getById(id);
+        if (isInScope(item, workspace, project)) {
+          scopedById.set(id, item);
+        }
+      }
+
+      const scopedItems = [...scopedById.values()];
+      let reports = new Map<string, KnowledgeHealth>();
+      if (scopedItems.length > 0) {
+        const batch = await healthGate.run(
+          exec.signal,
+          (signal) => checkKnowledgeHealthBatch(scopedItems, {
+            workspaceDirectory: workspace,
+            signal,
+          }),
+          () => null,
+        );
+        if (batch === null) {
+          const checkedAt = new Date().toISOString();
+          reports = new Map(scopedItems.map((item) => [
+            item.id,
+            makeBusyKnowledgeHealth(item, checkedAt),
+          ]));
+        } else {
+          reports = new Map(batch.results.map((report) => [report.knowledgeId, report]));
+        }
+      }
+
+      return {
+        ok: true,
+        results: ids.map((id) => {
+          const item = scopedById.get(id);
+          const health = reports.get(id);
+          return {
+            id,
+            health: item === undefined || health === undefined
+              ? null
+              : summarizeHealth(health, item.status, item.creationOrigin),
+          };
+        }),
+      };
+    },
+  });
+
+  for (const tool of [addTool, searchTool, listTool, getTool, archiveTool, freshnessTool, healthTool]) {
     tools.register(tool);
   }
+
+  return () => healthGate.dispose();
+}
+
+function validateHealthIds(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw new TypeError("ids must be an array of knowledge IDs.");
+  }
+  if (value.length < 1 || value.length > MAX_HEALTH_BATCH_ITEMS) {
+    throw new RangeError(`ids must contain between 1 and ${MAX_HEALTH_BATCH_ITEMS} items.`);
+  }
+  return value.map((id, index) => {
+    if (typeof id !== "string") {
+      throw new TypeError(`ids[${index}] must be a string.`);
+    }
+    validateBoundedText(id, `ids[${index}]`, MAX_ID_CHARS);
+    return id;
+  });
+}
+
+function summarizeHealth(
+  report: KnowledgeHealth,
+  knowledgeStatus: KnowledgeStatus,
+  creationOrigin: KnowledgeOrigin,
+) {
+  const visibleEvidence = report.evidence.slice(0, MAX_GIT_EVIDENCE_CHECKS);
+  return {
+    knowledgeStatus,
+    creationOrigin,
+    checkedAt: report.checkedAt,
+    status: report.status,
+    reasons: report.reasons,
+    evidenceCount: report.evidence.length + report.overflowCount,
+    evidenceTruncated: report.overflowCount > 0 || report.evidence.length > visibleEvidence.length,
+    overflowCount: report.overflowCount,
+    evidence: visibleEvidence.map((item) => ({
+      evidenceIndex: item.evidenceIndex,
+      status: item.status,
+      reason: item.reason,
+    })),
+  };
 }
 
 function resolveWorkspace(

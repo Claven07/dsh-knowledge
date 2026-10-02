@@ -19,6 +19,7 @@ const GIT_GLOBAL_ARGS = [
 export type GitCommandFailure =
   | "git_unavailable"
   | "timeout"
+  | "cancelled"
   | "operation_budget_exceeded"
   | "output_limit"
   | "spawn_error";
@@ -36,6 +37,7 @@ export interface GitCommandRunner {
     cwd: string,
     args: readonly string[],
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<GitCommandResult>;
 }
 
@@ -46,6 +48,8 @@ export type GitInspectionOptions = {
   commandTimeoutMs?: number;
   /** Total command budget; callers may lower the 8 second hard maximum. */
   operationBudgetMs?: number;
+  /** Optional caller cancellation propagated to native Git subprocesses. */
+  signal?: AbortSignal;
 };
 
 export type GitOperationReason =
@@ -63,6 +67,7 @@ export type GitOperationReason =
   | "missing_commit"
   | "missing_path_at_commit"
   | "timeout"
+  | "cancelled"
   | "operation_budget_exceeded"
   | "command_failed"
   | "malformed_output";
@@ -74,6 +79,11 @@ export type FileProvenanceCapture =
 export type FileSnapshotComparison = {
   status: "current" | "potentially_stale" | "unverifiable";
   reason?: GitOperationReason;
+};
+
+type InternalGitOperationReason = GitOperationReason | "source_path_missing";
+type InternalFileSnapshotComparison = Omit<FileSnapshotComparison, "reason"> & {
+  reason?: InternalGitOperationReason;
 };
 
 export type CaptureFileProvenanceOptions = GitInspectionOptions & {
@@ -91,6 +101,7 @@ type Budget = {
   startedAt: number;
   commandTimeoutMs: number;
   operationBudgetMs: number;
+  signal?: AbortSignal;
 };
 
 type GitRootResult =
@@ -182,7 +193,26 @@ export async function captureFileProvenance(
 export async function compareFileSnapshots(
   options: CompareFileSnapshotsOptions,
 ): Promise<FileSnapshotComparison[]> {
-  const results: FileSnapshotComparison[] = options.provenances.map(() => ({
+  const results = await compareFileSnapshotsInternal(options);
+  return results.map(({ status, reason }) => ({
+    status,
+    ...(reason === undefined
+      ? {}
+      : { reason: reason === "source_path_missing" ? "working_tree_changed" : reason }),
+  }));
+}
+
+/** @internal Returns M5's precise missing-path diagnostic without changing the public M3 API. */
+export async function compareFileSnapshotsForHealth(
+  options: CompareFileSnapshotsOptions,
+): Promise<InternalFileSnapshotComparison[]> {
+  return await compareFileSnapshotsInternal(options);
+}
+
+async function compareFileSnapshotsInternal(
+  options: CompareFileSnapshotsOptions,
+): Promise<InternalFileSnapshotComparison[]> {
+  const results: InternalFileSnapshotComparison[] = options.provenances.map(() => ({
     status: "unverifiable",
     reason: "operation_budget_exceeded",
   }));
@@ -287,7 +317,7 @@ export async function compareFileSnapshots(
       const path = item.provenance.path;
       const localState = localStates.get(path);
       if (localState === "missing") {
-        results[item.index] = { status: "potentially_stale", reason: "working_tree_changed" };
+        results[item.index] = { status: "potentially_stale", reason: "source_path_missing" };
         continue;
       }
       if (localState === "unsafe") {
@@ -398,6 +428,7 @@ function makeBudget(options: GitInspectionOptions): Budget {
     startedAt: Date.now(),
     commandTimeoutMs: Math.min(requestedCommandTimeout, DEFAULT_GIT_COMMAND_TIMEOUT_MS),
     operationBudgetMs: Math.min(requestedOperationBudget, DEFAULT_GIT_OPERATION_BUDGET_MS),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
   };
 }
 
@@ -648,6 +679,7 @@ function stripOneNewline(value: string): string {
 function commandFailureReason(result: GitCommandResult): GitOperationReason | undefined {
   if (result.failure === "git_unavailable") return "git_unavailable";
   if (result.failure === "timeout") return "timeout";
+  if (result.failure === "cancelled") return "cancelled";
   if (result.failure === "operation_budget_exceeded") return "operation_budget_exceeded";
   if (result.failure === "output_limit" || result.failure === "spawn_error") return "command_failed";
   if (result.exitCode === null) return "command_failed";
@@ -655,7 +687,7 @@ function commandFailureReason(result: GitCommandResult): GitOperationReason | un
 }
 
 function setUnverifiable(
-  results: FileSnapshotComparison[],
+  results: InternalFileSnapshotComparison[],
   items: readonly { index: number }[],
   reason: GitOperationReason,
 ): void {
@@ -669,6 +701,9 @@ async function runGit(
   args: readonly string[],
   budget: Budget,
 ): Promise<GitCommandResult> {
+  if (budget.signal?.aborted) {
+    return { exitCode: null, stdout: "", failure: "cancelled" };
+  }
   const remaining = budget.operationBudgetMs - (Date.now() - budget.startedAt);
   if (remaining <= 0) {
     return { exitCode: null, stdout: "", failure: "operation_budget_exceeded" };
@@ -677,11 +712,15 @@ async function runGit(
     cwd,
     [...GIT_GLOBAL_ARGS, ...args],
     Math.max(1, Math.min(budget.commandTimeoutMs, remaining)),
+    budget.signal,
   );
 }
 
 const nativeGitRunner: GitCommandRunner = {
-  run(cwd, args, timeoutMs) {
+  run(cwd, args, timeoutMs, signal) {
+    if (signal?.aborted) {
+      return Promise.resolve({ exitCode: null, stdout: "", failure: "cancelled" });
+    }
     return new Promise((resolve) => {
       const env: NodeJS.ProcessEnv = { ...process.env };
       for (const key of Object.keys(env)) {
@@ -704,6 +743,7 @@ const nativeGitRunner: GitCommandRunner = {
           shell: false,
           timeout: timeoutMs,
           windowsHide: true,
+          ...(signal === undefined ? {} : { signal }),
         },
         (error, stdout) => {
           if (error === null) {
@@ -711,7 +751,9 @@ const nativeGitRunner: GitCommandRunner = {
             return;
           }
           const code = (error as NodeJS.ErrnoException).code;
-          if (code === "ENOENT") {
+          if (code === "ABORT_ERR" || error.name === "AbortError") {
+            resolve({ exitCode: null, stdout, failure: "cancelled" });
+          } else if (code === "ENOENT") {
             resolve({ exitCode: null, stdout, failure: "git_unavailable" });
           } else if (
             code === "ETIMEDOUT" || error.killed || error.signal === "SIGTERM" ||

@@ -35,13 +35,18 @@ export function apply(ctx: Context, config: Config): void {
   let store: KnowledgeStore | undefined;
   let repository: KnowledgeRepository | null = null;
   let disposeExtraction: (() => Promise<void>) | undefined;
+  let disposeHealth: (() => Promise<void>) | undefined;
 
-  // Keep cleanup order explicit: stop extraction and wait briefly before closing SQLite.
+  // Stop extraction and active health checks before closing SQLite.
   ctx.effect(() => async () => {
     try {
       await disposeExtraction?.();
     } finally {
-      store?.close();
+      try {
+        await disposeHealth?.();
+      } finally {
+        store?.close();
+      }
     }
   }, "dsh-knowledge.store()");
 
@@ -70,7 +75,7 @@ export function apply(ctx: Context, config: Config): void {
   const tracker = new KnowledgeInjectionTracker();
   tracker.observe(ctx);
 
-  registerKnowledgeTools(ctx.tools, getRepository, config);
+  disposeHealth = registerKnowledgeTools(ctx.tools, getRepository, config);
   ctx.on(
     "agent/pre-step",
     createKnowledgePreStepHandler(getRepository, tracker, {
