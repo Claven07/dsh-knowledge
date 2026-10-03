@@ -13,7 +13,7 @@ M0 core storage, M1 native DeepSeek Harness tools, M2 deterministic ranked retri
 - Local SQLite storage through `better-sqlite3`; no ORM or remote service.
 - Create, get, list, deterministic `LIKE` search, update, archive, and supersede knowledge through the core repository.
 - Normalized evidence records and workspace/project scope.
-- Six DSH tools: `knowledge_add`, `knowledge_search`, `knowledge_list`, `knowledge_get`, `knowledge_archive`, and `knowledge_check_freshness`.
+- Seven DSH tools: `knowledge_add`, `knowledge_search`, `knowledge_list`, `knowledge_get`, `knowledge_archive`, `knowledge_check_freshness`, and `knowledge_health`.
 - `knowledge_add` opportunistically attaches the current commit and repository-relative path to clean, committed file evidence in the active session workspace.
 - `knowledge_check_freshness` compares Git-backed file evidence with the current repository snapshot without modifying knowledge or Git state.
 - Session evidence on explicit tool-created items when DSH provides a calling agent/session.
@@ -128,6 +128,8 @@ The aggregate status describes Git-backed file evidence. Session evidence does n
 ## Knowledge health (M5)
 
 `checkKnowledgeHealth()` and `checkKnowledgeHealthBatch()` summarize the same M3 Git comparison results. `knowledge_health` checks 1–16 IDs in the active workspace/project; `knowledge_get(..., includeHealth: true)` opts into a live check for one item. Health checks are explicit foreground operations against live repository state. Health is not persisted or cached, and never verifies, archives, supersedes, deletes, or edits knowledge. `current` means checkable Git-backed file snapshots match; it does not mean the claim is verified or true. `unverifiable` means the evidence could not be checked and does not mean the knowledge is false. Session-only automatic candidates therefore report `unverifiable` without Git-backed file evidence. Health returns at most 16 per-evidence details per item; additional evidence is counted in `overflowCount` and makes the result `unverifiable` unless stale evidence takes precedence. The existing `checkKnowledgeFreshness()` API and `knowledge_check_freshness` tool remain available for compatibility.
+
+`knowledge_health({ ids, includeGuidance: true })` opts into deterministic advisory guidance based only on the current health reasons, with no additional health or Git work. Guidance is absent by default, empty for current health, and null when health is null. An empty guidance array does not mean verified or true; `unverifiable` does not mean false. Guidance never changes knowledge or retrieval, and normal search and pre-step retrieval remain health-free.
 
 ## DSH architecture
 

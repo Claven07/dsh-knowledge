@@ -11,6 +11,10 @@ import {
 } from "../knowledge/health.js";
 import type { KnowledgeHealth } from "../knowledge/health.js";
 import { HarnessHealthRequestGate } from "./health-gate.js";
+import {
+  createHealthGuidance,
+  HEALTH_GUIDANCE_CODES,
+} from "./health-guidance.js";
 import type {
   Evidence,
   EvidenceType,
@@ -211,6 +215,22 @@ const healthOutputSchema = {
               health: {
                 oneOf: [healthReportOutputSchema, { type: "null" }],
                 required: true,
+              },
+              guidance: {
+                oneOf: [
+                  {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      properties: {
+                        code: { type: "string", enum: HEALTH_GUIDANCE_CODES, required: true },
+                        message: { type: "string", required: true },
+                      },
+                    },
+                  },
+                  { type: "null" },
+                ],
               },
             },
           },
@@ -715,6 +735,10 @@ export function registerKnowledgeTools(
         description: `Knowledge IDs to check (1–${MAX_HEALTH_BATCH_ITEMS}); use IDs from knowledge_list.`,
         items: { type: "string" },
       },
+      includeGuidance: {
+        type: "boolean",
+        description: "Opt in to deterministic, advisory follow-up guidance from health reasons. This adds no health or Git work and does not verify knowledge.",
+      },
     },
     output: {
       schema: healthOutputSchema,
@@ -769,11 +793,19 @@ export function registerKnowledgeTools(
         results: ids.map((id) => {
           const item = scopedById.get(id);
           const health = reports.get(id);
+          const summary = item === undefined || health === undefined
+            ? null
+            : summarizeHealth(health, item.status, item.creationOrigin);
           return {
             id,
-            health: item === undefined || health === undefined
-              ? null
-              : summarizeHealth(health, item.status, item.creationOrigin),
+            health: summary,
+            ...(args.includeGuidance === true
+              ? {
+                guidance: summary === null
+                  ? null
+                  : createHealthGuidance({ status: summary.status, reasons: summary.reasons }),
+              }
+              : {}),
           };
         }),
       };

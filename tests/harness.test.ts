@@ -1,6 +1,6 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Context } from "@deepseek-ai/cordis";
 import type { Agent, PreStepDecision } from "@deepseek-ai/dsh-agent";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -16,6 +16,10 @@ import { KnowledgeRepository } from "../src/knowledge/repository.js";
 import { retrieveRelevantKnowledge } from "../src/knowledge/retrieval.js";
 import { MAX_HEALTH_BATCH_ITEMS } from "../src/knowledge/health.js";
 import * as healthApi from "../src/knowledge/health.js";
+import type { KnowledgeHealth } from "../src/knowledge/health.js";
+import type { GitCommandRunner } from "../src/knowledge/git.js";
+import * as guidanceApi from "../src/harness/health-guidance.js";
+import type { HealthGuidance } from "../src/harness/health-guidance.js";
 import { KnowledgeStore } from "../src/knowledge/store.js";
 import type { Knowledge, KnowledgeType } from "../src/knowledge/types.js";
 import { KnowledgeInjectionTracker, KNOWLEDGE_CONTEXT_SOURCE } from "../src/harness/events.js";
@@ -27,7 +31,7 @@ import {
 } from "../src/harness/retrieval.js";
 import plugin, { apply, type Config } from "../src/harness/plugin.js";
 import type { KnowledgePreStepHandler } from "../src/harness/retrieval.js";
-import { createTemporaryGitRepository, initializeGitRepository } from "./git-fixtures.js";
+import { createTemporaryGitRepository, initializeGitRepository, runGit } from "./git-fixtures.js";
 
 type Listener = (...args: never[]) => unknown;
 
@@ -620,7 +624,7 @@ describe("DeepSeek Harness plugin adapters", () => {
       { id: otherProject.id, health: null },
       { id: "missing-id", health: null },
     ]);
-    expect(Object.keys(harness.definitions.get("knowledge_health")!.parameters.properties)).toEqual(["ids"]);
+    expect(Object.keys(harness.definitions.get("knowledge_health")!.parameters.properties as Record<string, unknown>)).toEqual(["ids", "includeGuidance"]);
     expect(JSON.stringify(result)).not.toContain("Outside workspace");
     expect(JSON.stringify(result)).not.toContain("Outside project");
     expect(JSON.stringify(result)).not.toContain("Automatic session candidates have no Git-backed evidence.");
@@ -839,7 +843,7 @@ describe("DeepSeek Harness plugin adapters", () => {
     const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch");
     const session = makeSession("C:\\workspace\\payments");
 
-    expect(harness.definitions.get("knowledge_get")!.parameters.properties.includeHealth).toMatchObject({
+    expect((harness.definitions.get("knowledge_get")!.parameters.properties as Record<string, unknown>).includeHealth).toMatchObject({
       type: "boolean",
     });
 
@@ -1621,6 +1625,396 @@ describe("DeepSeek Harness plugin adapters", () => {
     expect(harness.warnings.some((warning) => warning.includes("could not be opened"))).toBe(true);
   });
 });
+
+describe("opt-in knowledge health guidance", () => {
+  it("preserves omitted/false output and evaluates health only once per request", async () => {
+    const harness = createPluginHarness({ project: "payments" });
+    const repository = openRepository(harness.path);
+    const item = repository.create({
+      type: "fact", content: "Review guidance is explicitly requested.",
+      scope: { workspace: "workspace-a", project: "payments" },
+    });
+    const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch");
+    const guidance = vi.spyOn(guidanceApi, "createHealthGuidance");
+    vi.spyOn(Date.prototype, "toISOString").mockReturnValue("2026-10-03T00:00:00.000Z");
+    const session = makeSession("workspace-a");
+    const ordinary = await harness.invoke("knowledge_health", { ids: [item.id, "missing"] }, session) as ToolHealthResult;
+    const explicitFalse = await harness.invoke("knowledge_health", {
+      ids: [item.id, "missing"], includeGuidance: false,
+    }, session);
+
+    expect(explicitFalse).toEqual(ordinary);
+    expect(Object.keys(ordinary)).toEqual(["ok", "results"]);
+    expect(ordinary.results.map(Object.keys)).toEqual([["id", "health"], ["id", "health"]]);
+    expect(ordinary.results[1]).toEqual({ id: "missing", health: null });
+    expect(checkHealth).toHaveBeenCalledTimes(2);
+    expect(guidance).not.toHaveBeenCalled();
+    const guided = await harness.invoke("knowledge_health", {
+      ids: [item.id, "missing"], includeGuidance: true,
+    }, session) as ToolHealthResult;
+    expect(guided.results.map(({ guidance: _guidance, ...entry }) => entry)).toEqual(ordinary.results);
+    expect(checkHealth).toHaveBeenCalledTimes(3);
+    expect(guidance).toHaveBeenCalledExactlyOnceWith({
+      status: "unverifiable", reasons: ["no_git_backed_file_evidence"],
+    });
+    for (const [name, definition] of harness.definitions) {
+      if (name !== "knowledge_health") {
+        expect(definition.parameters.properties).not.toHaveProperty("includeGuidance");
+        expect(JSON.stringify(definition.output.schema)).not.toContain('"guidance"');
+      }
+    }
+  });
+
+  it.each(["current", "changed", "missing", "unindexed"] as const)(
+    "adds safe guidance for a real %s source without extra Git work", async (state) => {
+      const { repo, harness, repository, item, session } = await createGuidanceFixture();
+      try {
+        if (state === "changed") repo.write("src/private-policy.ts", "changed private source\n");
+        if (state === "missing") unlinkSync(join(repo.directory, "src", "private-policy.ts"));
+        if (state === "unindexed") await repo.git(["rm", "--cached", "--", "src/private-policy.ts"]);
+        const actualHealth = healthApi.checkKnowledgeHealthBatch;
+        const runner: GitCommandRunner = { run: vi.fn(async (cwd, args) => ({ exitCode: 0, stdout: await runGit(cwd, args) })) };
+        const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch")
+          .mockImplementation((items, options) => actualHealth(items, { ...options, runner }));
+        const ordinary = await harness.invoke("knowledge_health", { ids: [item.id] }, session) as ToolHealthResult;
+        const gitCalls = vi.mocked(runner.run).mock.calls.length;
+        expect(gitCalls).toBeGreaterThan(0);
+        vi.mocked(runner.run).mockClear();
+        const guided = await harness.invoke("knowledge_health", { ids: [item.id], includeGuidance: true }, session) as ToolHealthResult;
+        const result = guided.results[0]!;
+
+        expect(checkHealth).toHaveBeenCalledTimes(2);
+        expect(runner.run).toHaveBeenCalledTimes(gitCalls);
+        expect(vi.mocked(runner.run).mock.calls.every(([cwd]) => resolve(cwd) === resolve(repo.directory))).toBe(true);
+        expect(checkHealth.mock.calls.every(([, options]) => options.workspaceDirectory === session.header.cwd)).toBe(true);
+        expect(result.health).toEqual({ ...ordinary.results[0]!.health, checkedAt: result.health!.checkedAt });
+        expect(result.health!.status).toBe(state === "current" ? "current" : "potentially_stale");
+        expect(result.health!.reasons).toEqual([state === "current" ? "snapshot_matches" : state === "missing" ? "source_path_missing" : "working_tree_changed"]);
+        expect(result.guidance!.map(({ code }) => code)).toEqual(state === "current" ? [] : ["review_claim"]);
+        expect(repository.getById(item.id)).toEqual(item);
+        const json = JSON.stringify(guided);
+        for (const privateValue of [repo.directory, "src/private-policy.ts", item.evidence[0]!.gitProvenance!.commit, item.content, "private source", "changed private source"]) {
+          expect(json).not.toContain(privateValue);
+        }
+        expect(json).not.toMatch(/diff --git|fatal:|spawn|permission denied/i);
+        expect(JSON.stringify(result.guidance)).not.toMatch(/edited|deleted|renamed/i);
+      } finally {
+        repo.cleanup();
+      }
+    }, 20_000,
+  );
+
+  it("keeps unavailable Git unverifiable and does not disclose process output", async () => {
+    const { repo, harness, item, session } = await createGuidanceFixture();
+    try {
+      const actualHealth = healthApi.checkKnowledgeHealthBatch;
+      const runner: GitCommandRunner = { run: vi.fn(async () => ({
+        exitCode: null, stdout: "fatal: C:\\private\\source password=secret", failure: "git_unavailable" as const,
+      })) };
+      const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch")
+        .mockImplementation((items, options) => actualHealth(items, { ...options, runner }));
+      const result = await harness.invoke("knowledge_health", { ids: [item.id], includeGuidance: true }, session) as ToolHealthResult;
+      expect(result.results[0]).toMatchObject({
+        health: { status: "unverifiable", reasons: ["git_unavailable"] },
+        guidance: [{ code: "check_environment" }],
+      });
+      expect(checkHealth).toHaveBeenCalledOnce();
+      expect(runner.run).toHaveBeenCalledOnce();
+      expect(JSON.stringify(result)).not.toMatch(/fatal:|private|password=secret|source\.ts/);
+    } finally {
+      repo.cleanup();
+    }
+  }, 20_000);
+
+  it("preserves extracted automatic candidates and explicit lifecycle states without Git", async () => {
+    const harness = createPluginHarness({ project: "payments", automaticExtraction: true });
+    const session = makeSession("workspace-a");
+    const created = deferred<void>();
+    const actualCreate = KnowledgeRepository.prototype.create;
+    vi.spyOn(KnowledgeRepository.prototype, "create").mockImplementation(function (this: KnowledgeRepository, input) {
+      const item = actualCreate.call(this, input);
+      if (input.creationOrigin === "automatic") created.resolve();
+      return item;
+    });
+    emitTurn(harness, session, 1, "The project uses PostgreSQL for its database.");
+    await created.promise;
+    const repository = openRepository(harness.path);
+    const automatic = repository.list({ creationOrigin: "automatic" })[0]!;
+    const explicit = repository.create({ type: "lesson", content: "Explicit database guidance.", scope: automatic.scope });
+    const verified = repository.create({ type: "fact", content: "Verified database guidance.", scope: automatic.scope });
+    repository.update(verified.id, { status: "verified" });
+    const before = repository.list();
+    const runner: GitCommandRunner = { run: vi.fn() };
+    const actualHealth = healthApi.checkKnowledgeHealthBatch;
+    const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch")
+      .mockImplementation((items, options) => actualHealth(items, { ...options, runner }));
+    const result = await harness.invoke("knowledge_health", {
+      ids: [automatic.id, explicit.id, verified.id], includeGuidance: true,
+    }, session) as ToolHealthResult;
+
+    expect(result.results.map(({ health }) => [health!.knowledgeStatus, health!.creationOrigin])).toEqual([
+      ["candidate", "automatic"], ["candidate", "explicit"], ["verified", "explicit"],
+    ]);
+    for (const entry of result.results) {
+      expect(entry.health!.status).toBe("unverifiable");
+      expect(entry.guidance!.map(({ code }) => code)).toEqual(["review_evidence"]);
+    }
+    expect(checkHealth).toHaveBeenCalledOnce();
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(repository.list()).toEqual(before);
+    expect(retrieveRelevantKnowledge(repository, "PostgreSQL database", { workspace: "workspace-a", project: "payments" })
+      .map(({ knowledge }) => knowledge.id)).not.toContain(automatic.id);
+  });
+
+  it("keeps missing and exact-scope failures null without health or guidance work", async () => {
+    const harness = createPluginHarness({ project: "payments" });
+    const repository = openRepository(harness.path);
+    const outside = [
+      { workspace: "workspace-b", project: "payments" },
+      { workspace: "workspace-a", project: "identity" },
+      { workspace: "workspace-a" },
+    ].map((scope) => repository.create({ type: "fact", content: "Private outside claim.", scope }));
+    const ids = [...outside.map(({ id }) => id), "missing"];
+    const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch");
+    const guidance = vi.spyOn(guidanceApi, "createHealthGuidance");
+    const session = makeSession("workspace-a");
+    expect(await harness.invoke("knowledge_health", { ids }, session)).toEqual({
+      ok: true, results: ids.map((id) => ({ id, health: null })),
+    });
+    expect(await harness.invoke("knowledge_health", { ids, includeGuidance: true }, session)).toEqual({
+      ok: true, results: ids.map((id) => ({ id, health: null, guidance: null })),
+    });
+    expect(checkHealth).not.toHaveBeenCalled();
+    expect(guidance).not.toHaveBeenCalled();
+    expect(harness.definitions.get("knowledge_health")!.parameters.properties).not.toHaveProperty("workspace");
+    expect(await harness.invoke("knowledge_health", { ids })).toEqual(
+      await harness.invoke("knowledge_health", { ids, includeGuidance: true }),
+    );
+  });
+
+  it("preserves stale-overflow precedence without traversing 50k evidence for guidance", async () => {
+    const { repo, harness, repository, item, session } = await createGuidanceFixture();
+    try {
+      repo.write("src/private-policy.ts", "changed source\n");
+      const evidence = new Proxy([
+        item.evidence[0]!,
+        ...Array.from({ length: 49_999 }, () => ({ type: "session" as const, source: "private-session", timestamp: item.createdAt })),
+      ], {
+        get(target, property, receiver) {
+          if (typeof property === "string" && /^\d+$/.test(property) && Number(property) >= 16) {
+            throw new Error("Health or guidance accessed overflow evidence.");
+          }
+          return Reflect.get(target, property, receiver);
+        },
+        has(target, property) {
+          if (typeof property === "string" && /^\d+$/.test(property) && Number(property) >= 16) {
+            throw new Error("Health or guidance inspected overflow evidence.");
+          }
+          return Reflect.has(target, property);
+        },
+      });
+      vi.spyOn(KnowledgeRepository.prototype, "getById").mockReturnValue({ ...item, evidence });
+      const guidance = vi.spyOn(guidanceApi, "createHealthGuidance");
+      const result = await harness.invoke("knowledge_health", { ids: [item.id], includeGuidance: true }, session) as ToolHealthResult;
+      expect(result.results[0]!.health).toMatchObject({
+        status: "potentially_stale", reasons: ["working_tree_changed", "evidence_overflow"],
+        evidenceCount: 50_000, overflowCount: 49_984, evidenceTruncated: true,
+      });
+      expect(result.results[0]!.health!.evidence).toHaveLength(16);
+      expect(result.results[0]!.guidance!.map(({ code }) => code)).toEqual(["inspection_incomplete", "review_claim"]);
+      expect(guidance).toHaveBeenCalledExactlyOnceWith({
+        status: "potentially_stale", reasons: ["working_tree_changed", "evidence_overflow"],
+      });
+    } finally {
+      repo.cleanup();
+    }
+  }, 20_000);
+
+  it.each(["knowledge_health", "knowledge_get"] as const)(
+    "shares the process gate with active %s without queuing or retrying", async (firstTool) => {
+      const harness = createPluginHarness({ project: "payments" });
+      const other = createPluginHarness({ project: "payments" }, harness.path);
+      const repository = openRepository(harness.path);
+      const item = repository.create({ type: "fact", content: "Shared health slot.", scope: { workspace: "workspace-a", project: "payments" } });
+      const session = makeSession("workspace-a");
+      const started = deferred<void>();
+      const release = deferred<void>();
+      const actualHealth = healthApi.checkKnowledgeHealthBatch;
+      const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch").mockImplementationOnce(async (items, options) => {
+        started.resolve();
+        await release.promise;
+        return actualHealth(items, options);
+      });
+      const active = harness.invoke(firstTool, firstTool === "knowledge_get"
+        ? { id: item.id, includeHealth: true }
+        : { ids: [item.id], includeGuidance: true }, session);
+      await started.promise;
+      try {
+        const busy = await other.invoke("knowledge_health", { ids: [item.id], includeGuidance: true }, session) as ToolHealthResult;
+        expect(busy.results[0]).toMatchObject({
+          health: { status: "unverifiable", reasons: ["health_check_busy"] },
+          guidance: [{ code: "retry_explicit_check" }],
+        });
+        if (firstTool === "knowledge_health") {
+          expect(await other.invoke("knowledge_get", { id: item.id, includeHealth: true }, session))
+            .toMatchObject({ health: { reasons: ["health_check_busy"] } });
+        }
+        expect(checkHealth).toHaveBeenCalledOnce();
+      } finally {
+        release.resolve();
+        await active;
+      }
+      const next = await other.invoke("knowledge_health", { ids: [item.id], includeGuidance: true }, session) as ToolHealthResult;
+      expect(next.results[0]!.health!.reasons).toEqual(["no_git_backed_file_evidence"]);
+      expect(checkHealth).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("releases the health gate before synchronous guidance generation", async () => {
+    const harness = createPluginHarness();
+    const repository = openRepository(harness.path);
+    const item = repository.create({ type: "fact", content: "Guidance is outside the health slot.", scope: { workspace: "workspace-a" } });
+    const session = makeSession("workspace-a");
+    const actualGuidance = guidanceApi.createHealthGuidance;
+    const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch");
+    let nested: Promise<unknown> | undefined;
+    vi.spyOn(guidanceApi, "createHealthGuidance").mockImplementationOnce((input) => {
+      nested = harness.invoke("knowledge_health", { ids: [item.id] }, session);
+      return actualGuidance(input);
+    });
+    await harness.invoke("knowledge_health", { ids: [item.id], includeGuidance: true }, session);
+    expect(await nested).toMatchObject({ results: [{ health: { reasons: ["no_git_backed_file_evidence"] } }] });
+    expect(checkHealth).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels and awaits guided health before closing the actual plugin-owned store", async () => {
+    const harness = createPluginHarness();
+    const session = makeSession("workspace-a");
+    const added = await harness.invoke("knowledge_add", {
+      type: "fact", content: "Disposal keeps health work safe.", workspace: "workspace-a",
+    }, session) as ToolItemResult;
+    const started = deferred<void>();
+    const aborted = deferred<void>();
+    const release = deferred<void>();
+    const events: string[] = [];
+    let ownedStore: KnowledgeStore | undefined;
+    const actualClose = KnowledgeStore.prototype.close;
+    const close = vi.spyOn(KnowledgeStore.prototype, "close").mockImplementation(function (this: KnowledgeStore) {
+      ownedStore = this;
+      events.push("closed");
+      actualClose.call(this);
+    });
+    vi.spyOn(healthApi, "checkKnowledgeHealthBatch").mockImplementationOnce(async (items, { signal }) => {
+      signal!.addEventListener("abort", () => { events.push("aborted"); aborted.resolve(); }, { once: true });
+      started.resolve();
+      await release.promise;
+      expect(signal!.aborted).toBe(true);
+      events.push("settled");
+      return {
+        checkedAt: "2026-10-03T00:00:00.000Z",
+        results: items.map(({ id }) => ({ knowledgeId: id, checkedAt: "2026-10-03T00:00:00.000Z", status: "unverifiable", reasons: ["cancelled"], evidence: [], overflowCount: 0 })),
+      };
+    });
+    const active = harness.invoke("knowledge_health", { ids: [added.item!.id], includeGuidance: true }, session) as Promise<ToolHealthResult>;
+    await started.promise;
+    const disposal = harness.dispose();
+    try {
+      await aborted.promise;
+      expect(close).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await disposal;
+    }
+    expect((await active).results[0]).toMatchObject({ health: { reasons: ["cancelled"] }, guidance: [{ code: "retry_explicit_check" }] });
+    expect(events).toEqual(["aborted", "settled", "closed"]);
+    expect(close).toHaveBeenCalledOnce();
+    expect(ownedStore!.path).toBe(harness.path);
+    expect(ownedStore!.database.open).toBe(false);
+  });
+
+  it("leaves actual M2 ranking, scope, duplicates and pre-step retrieval unchanged", async () => {
+    const { repo, harness, repository, item, session } = await createGuidanceFixture();
+    try {
+      repo.write("src/private-policy.ts", "changed source\n");
+      const projectVerified = repository.create({ type: "fact", content: "ResponseRouter guidance for provider routing.", scope: item.scope });
+      repository.update(projectVerified.id, { status: "verified" });
+      const duplicate = repository.create({ type: "fact", content: projectVerified.content, scope: item.scope });
+      const workspace = repository.create({ type: "fact", content: "ResponseRouter guidance for shared providers.", scope: { workspace: repo.directory } });
+      repository.update(workspace.id, { status: "verified" });
+      const automatic = repository.create({ type: "fact", content: "ResponseRouter guidance for automatic routing.", scope: item.scope, creationOrigin: "automatic" });
+      const outside = repository.create({ type: "fact", content: "ResponseRouter guidance for another project.", scope: { workspace: repo.directory, project: "identity" } });
+      const retrieve = () => retrieveRelevantKnowledge(repository, "ResponseRouter guidance", { workspace: repo.directory, project: "payments" })
+        .map(({ knowledge, score, explanation }) => ({ id: knowledge.id, score, explanation }));
+      const before = retrieve();
+      const beforeStored = repository.list();
+      const beforeContext = await runPreStep(harness, makeSession(repo.directory), "ResponseRouter guidance");
+      const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch");
+      const guidance = vi.spyOn(guidanceApi, "createHealthGuidance");
+      const result = await harness.invoke("knowledge_health", { ids: [item.id, automatic.id], includeGuidance: true }, session) as ToolHealthResult;
+      expect(result.results[0]!.health!.status).toBe("potentially_stale");
+      expect(retrieve()).toEqual(before);
+      expect(repository.list()).toEqual(beforeStored);
+      const ids = before.map(({ id }) => id);
+      expect(ids).toContain(item.id);
+      expect(ids).toContain(projectVerified.id);
+      expect(ids.indexOf(projectVerified.id)).toBeLessThan(ids.indexOf(item.id));
+      expect(ids.indexOf(item.id)).toBeLessThan(ids.indexOf(workspace.id));
+      expect(ids).not.toContain(automatic.id);
+      expect(ids).not.toContain(outside.id);
+      expect(ids).not.toContain(duplicate.id);
+      expect(before.find(({ id }) => id === projectVerified.id)!.explanation.suppressedSimilarIds).toContain(duplicate.id);
+      checkHealth.mockClear();
+      guidance.mockClear();
+      const afterContext = await runPreStep(harness, makeSession(repo.directory), "ResponseRouter guidance");
+      expect(afterContext.messages.at(-1)!.source).toEqual(beforeContext.messages.at(-1)!.source);
+      expect(afterContext.messages.at(-1)!.content).toEqual(beforeContext.messages.at(-1)!.content);
+      for (const args of [{ id: item.id }, { id: item.id, includeHealth: false }]) {
+        expect(await harness.invoke("knowledge_get", args, session)).not.toHaveProperty("health");
+      }
+      expect(await harness.invoke("knowledge_search", { query: "ResponseRouter guidance" }, session)).not.toHaveProperty("health");
+      expect(checkHealth).not.toHaveBeenCalled();
+      expect(guidance).not.toHaveBeenCalled();
+    } finally {
+      repo.cleanup();
+    }
+  }, 20_000);
+});
+
+type ToolHealthResult = {
+  ok: boolean;
+  results: Array<{
+    id: string;
+    health: null | Pick<KnowledgeHealth, "status" | "reasons" | "checkedAt" | "overflowCount"> & {
+      knowledgeStatus: Knowledge["status"];
+      creationOrigin: Knowledge["creationOrigin"];
+      evidenceCount: number;
+      evidenceTruncated: boolean;
+      evidence: unknown[];
+    };
+    guidance?: HealthGuidance[] | null;
+  }>;
+};
+
+async function createGuidanceFixture() {
+  const repo = createTemporaryGitRepository("dsh-knowledge-guidance-");
+  await initializeGitRepository(repo.directory);
+  repo.write("src/private-policy.ts", "private source contents\n");
+  const commit = await repo.commit("policy");
+  const harness = createPluginHarness({ project: "payments" });
+  const repository = openRepository(harness.path);
+  const item = repository.create({
+    type: "decision", content: "ResponseRouter guidance for project fallback.",
+    scope: { workspace: repo.directory, project: "payments" },
+    evidence: [{ type: "file", source: "src/private-policy.ts", timestamp: new Date(extractionEventTime).toISOString(), gitProvenance: { commit, path: "src/private-policy.ts" } }],
+  });
+  return { repo, harness, repository, item, session: makeSession(repo.directory) };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((settle) => { resolve = settle; });
+  return { promise, resolve };
+}
 
 type ToolSummary = {
   id: string;
