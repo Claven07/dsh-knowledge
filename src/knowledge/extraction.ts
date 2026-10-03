@@ -82,7 +82,7 @@ export function containsSensitiveContent(value: string): boolean {
 export function extractKnowledgeCandidates(
   input: KnowledgeExtractionInput,
 ): KnowledgeDetectionResult {
-  validateInput(input);
+  validateExtractionInput(input);
   const candidates: KnowledgeCandidateProposal[] = [];
   let sensitiveCount = 0;
   let totalCharacters = 0;
@@ -130,7 +130,19 @@ export function persistKnowledgeCandidates(
   repository: KnowledgeRepository,
   input: KnowledgeExtractionInput,
 ): KnowledgeExtractionResult {
-  const { candidates, sensitiveCount } = extractKnowledgeCandidates(input);
+  const detection = extractKnowledgeCandidates(input);
+  return admitAutomaticCandidates(repository, input.scope, detection);
+}
+
+/** @internal Admits already-filtered detector proposals; not a public ingestion API. */
+export function admitAutomaticCandidates(
+  repository: KnowledgeRepository,
+  scope: KnowledgeScope,
+  { candidates, sensitiveCount }: KnowledgeDetectionResult,
+): KnowledgeExtractionResult {
+  if (candidates.length > MAX_CANDIDATES_PER_TURN) {
+    throw new RangeError("Automatic admission exceeds the per-turn proposal limit.");
+  }
   const created: Knowledge[] = [];
   let duplicate = 0;
 
@@ -138,8 +150,8 @@ export function persistKnowledgeCandidates(
     const existing: Knowledge[] = [];
     for (const status of ["candidate", "verified"] as const) {
       existing.push(...repository.list({
-        workspace: input.scope.workspace,
-        project: input.scope.project ?? null,
+        workspace: scope.workspace,
+        project: scope.project ?? null,
         type: candidate.type,
         status,
         limit: MAX_DUPLICATE_CHECK_ITEMS,
@@ -148,7 +160,7 @@ export function persistKnowledgeCandidates(
     if (existing.some((item) => areConservativeDuplicates(item, {
       type: candidate.type,
       content: candidate.content,
-      scope: input.scope,
+      scope,
     }))) {
       duplicate += 1;
       continue;
@@ -158,7 +170,7 @@ export function persistKnowledgeCandidates(
     created.push(repository.create({
       type: candidate.type,
       content: candidate.content,
-      scope: input.scope,
+      scope,
       evidence: candidate.evidence,
       creationOrigin: "automatic",
     }));
@@ -229,7 +241,8 @@ function finishSentence(value: string): string {
   return /[.!?]$/.test(value) ? value : `${value}.`;
 }
 
-function validateInput(input: KnowledgeExtractionInput): void {
+/** @internal Shared structural validation for deterministic extraction inputs. */
+export function validateExtractionInput(input: KnowledgeExtractionInput): void {
   if (typeof input.sessionId !== "string" || input.sessionId.trim().length === 0) {
     throw new TypeError("Extraction input must include a session ID.");
   }
