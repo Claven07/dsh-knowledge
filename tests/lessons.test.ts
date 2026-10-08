@@ -14,6 +14,7 @@ import {
 import { checkKnowledgeHealth } from "../src/knowledge/health.js";
 import {
   extractLessonCandidates,
+  extractLessonCandidatesWithActionReferences,
   type LessonExtractionEventReference,
   type LessonExtractionInput,
   type LessonReferenceSpan,
@@ -193,6 +194,25 @@ const staticPositiveFixtures: Fixture[] = [
 ];
 
 describe("deterministic durable lesson detection", () => {
+  it("exposes only the grammar-selected action reference for transient correlation", () => {
+    const detected = extractLessonCandidatesWithActionReferences(input([event(assertedCorrection)]));
+    expect(detected.candidates).toMatchObject([{
+      sequence: 17,
+      actionReference: "ResponseRouter",
+      proposal: { type: "lesson", content: correction },
+    }]);
+    expect(extractLessonCandidates(input([event(assertedCorrection)])).candidates)
+      .toEqual(detected.candidates.map(({ proposal }) => proposal));
+    expect(JSON.stringify(detected.candidates[0])).not.toContain("referenceSpans");
+  });
+
+  it("does not invent one action reference for a prerequisite lesson", () => {
+    const value = fixture("This repository requires package.json before typecheck.");
+    const detected = extractLessonCandidatesWithActionReferences(input([event(value)]));
+    expect(detected.candidates[0]?.proposal.content).toBe(value.text);
+    expect(detected.candidates[0]?.actionReference).toBeUndefined();
+  });
+
   it.each(staticPositiveFixtures)("accepts a preventive rule with declared reference intent: $text", (value) => {
     expectAccepted(value);
   });

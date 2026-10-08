@@ -1,13 +1,20 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { Session, SessionEvent } from "@deepseek-ai/dsh-session";
 import {
+  MAX_CANDIDATES_PER_TURN,
   MAX_EXTRACTION_EVENT_CHARS,
   MAX_EXTRACTION_EVENTS,
   MAX_EXTRACTION_TOTAL_CHARS,
+  admitAutomaticCandidates,
   containsSensitiveContent,
-  persistKnowledgeCandidates,
+  extractKnowledgeCandidates,
 } from "../knowledge/extraction.js";
-import type { ExtractionEventReference } from "../knowledge/extraction.js";
+import type { ExtractionEventReference, KnowledgeDetectionResult, KnowledgeCandidateProposal } from "../knowledge/extraction.js";
+import {
+  extractLessonCandidatesWithActionReferences,
+  MAX_LESSON_SESSION_ID_CHARS,
+} from "../knowledge/lessons.js";
+import type { LessonCandidateWithActionReference, LessonExtractionEventReference } from "../knowledge/lessons.js";
 import type { KnowledgeRepository } from "../knowledge/repository.js";
 import type { KnowledgeScope } from "../knowledge/types.js";
 
@@ -15,6 +22,7 @@ export const MAX_QUEUED_EXTRACTION_JOBS = 8;
 export const EXTRACTION_SHUTDOWN_TIMEOUT_MS = 500;
 const MAX_USER_EVENTS_PER_TURN = MAX_EXTRACTION_EVENTS;
 const MAX_USER_MESSAGE_BLOCKS = 32;
+const MAX_OUTCOME_INVOCATIONS_PER_TURN = 8;
 
 export type ExtractionEnqueueResult = "queued" | "duplicate" | "queue_full" | "closed";
 
@@ -32,7 +40,42 @@ type TurnBuffer = {
   scope: KnowledgeScope | null;
   events: ExtractionEventReference[];
   characters: number;
+  activeStep?: number;
+  pendingMessageSequences: number[];
+  stepByMessageSequence: Map<number, number>;
+  ambiguousMessageSequences: Set<number>;
+  stepTrackingInvalid: boolean;
+  invocations: InvocationRecord[];
+  outcomeOverflowed: boolean;
 };
+
+type InvocationOutcome = Readonly<{
+  outcome: "success" | "failure";
+  sequence: number;
+  timestamp: string;
+}>;
+
+type InvocationRecord = {
+  kind: "native" | "ptc";
+  turn: number;
+  step: number;
+  invocationId: string;
+  toolName: string;
+  rootCallId?: string;
+  parentCallId?: string;
+  outcome?: InvocationOutcome;
+  invalid: boolean;
+};
+
+type ExtractionSnapshot = Readonly<{
+  turn: number;
+  events: readonly ExtractionEventReference[];
+  stepByMessageSequence: ReadonlyMap<number, number>;
+  ambiguousMessageSequences: ReadonlySet<number>;
+  stepTrackingInvalid: boolean;
+  invocations: readonly InvocationRecord[];
+  outcomeOverflowed: boolean;
+}>;
 
 type QueueEntry<Job> = {
   job: Job;
@@ -304,12 +347,43 @@ export function observeKnowledgeExtraction(
         scope: scopeFor(session, options.project),
         events: [],
         characters: 0,
+        pendingMessageSequences: [],
+        stepByMessageSequence: new Map(),
+        ambiguousMessageSequences: new Set(),
+        stepTrackingInvalid: false,
+        invocations: [],
+        outcomeOverflowed: false,
       });
       return;
     }
 
     const buffer = buffers.get(session);
     if (buffer === undefined) {
+      return;
+    }
+
+    if (event.type === "step/start") {
+      observeStepStart(buffer, event.data.turn, event.data.step);
+      return;
+    }
+    if (event.type === "step/end") {
+      observeStepEnd(buffer, event.data.turn, event.data.step);
+      return;
+    }
+    if (event.type === "tool/call") {
+      observeNativeCall(buffer, event.data);
+      return;
+    }
+    if (event.type === "tool/result") {
+      observeNativeResult(buffer, event.data, event.seq, event.time);
+      return;
+    }
+    if (event.type === "tool/ptc-dispatch-start") {
+      observePtcStart(buffer, event.data);
+      return;
+    }
+    if (event.type === "tool/ptc-dispatch") {
+      observePtcResult(buffer, event.data, event.seq, event.time);
       return;
     }
 
@@ -337,6 +411,7 @@ export function observeKnowledgeExtraction(
         author: "human",
         text,
       });
+      observeUserMessageStep(buffer, event.seq);
       buffer.characters += text.length;
       return;
     }
@@ -357,7 +432,15 @@ export function observeKnowledgeExtraction(
     }
     const sessionId = String(session.id);
     const scope = buffer.scope;
-    const events = buffer.events;
+    const snapshot: ExtractionSnapshot = {
+      turn: buffer.turn,
+      events: buffer.events,
+      stepByMessageSequence: new Map(buffer.stepByMessageSequence),
+      ambiguousMessageSequences: new Set(buffer.ambiguousMessageSequences),
+      stepTrackingInvalid: buffer.stepTrackingInvalid,
+      invocations: buffer.outcomeOverflowed ? [] : buffer.invocations.map((record) => ({ ...record })),
+      outcomeOverflowed: buffer.outcomeOverflowed,
+    };
     const job: ExtractionJob = {
       owner,
       key: JSON.stringify([owner, sessionId, buffer.turn]),
@@ -371,10 +454,10 @@ export function observeKnowledgeExtraction(
         if (repository === null) {
           return;
         }
-        persistKnowledgeCandidates(repository, {
+        persistTurnCandidates(repository, {
           sessionId,
           scope,
-          events,
+          snapshot,
         });
       },
       onFailure: () => options.onFailure?.(),
@@ -420,6 +503,267 @@ export function observeKnowledgeExtraction(
       );
     },
     whenIdle: () => processExtractionQueue.whenIdle((job) => job.owner === owner),
+  };
+}
+
+function observeStepStart(buffer: TurnBuffer, turn: number, step: number): void {
+  if (turn !== buffer.turn || !Number.isSafeInteger(step) || step < 0) {
+    buffer.stepTrackingInvalid = true;
+    return;
+  }
+  if (buffer.activeStep !== undefined) {
+    buffer.stepTrackingInvalid = true;
+    buffer.activeStep = undefined;
+    buffer.pendingMessageSequences = [];
+    return;
+  }
+  buffer.activeStep = step;
+  for (const sequence of buffer.pendingMessageSequences) {
+    if (buffer.ambiguousMessageSequences.has(sequence)) continue;
+    if (buffer.stepByMessageSequence.has(sequence)) {
+      buffer.ambiguousMessageSequences.add(sequence);
+      buffer.stepByMessageSequence.delete(sequence);
+      continue;
+    }
+    buffer.stepByMessageSequence.set(sequence, step);
+  }
+  buffer.pendingMessageSequences = [];
+}
+
+function observeStepEnd(buffer: TurnBuffer, turn: number, step: number): void {
+  if (turn !== buffer.turn || buffer.activeStep !== step) {
+    buffer.stepTrackingInvalid = true;
+    buffer.activeStep = undefined;
+    buffer.pendingMessageSequences = [];
+    return;
+  }
+  buffer.activeStep = undefined;
+}
+
+function observeUserMessageStep(buffer: TurnBuffer, sequence: number): void {
+  if (buffer.stepTrackingInvalid) return;
+  if (buffer.stepByMessageSequence.has(sequence) || buffer.pendingMessageSequences.includes(sequence)) {
+    buffer.ambiguousMessageSequences.add(sequence);
+    buffer.stepByMessageSequence.delete(sequence);
+    buffer.pendingMessageSequences = buffer.pendingMessageSequences.filter((value) => value !== sequence);
+    return;
+  }
+  if (buffer.activeStep === undefined) {
+    buffer.pendingMessageSequences.push(sequence);
+  } else {
+    buffer.stepByMessageSequence.set(sequence, buffer.activeStep);
+  }
+}
+
+function observeNativeCall(
+  buffer: TurnBuffer,
+  data: { turn: number; step: number; callId: string; name: string },
+): void {
+  if (
+    data.turn !== buffer.turn || !Number.isSafeInteger(data.step) || data.step < 0 ||
+    typeof data.callId !== "string" || data.callId.length === 0 ||
+    typeof data.name !== "string" || data.name.length === 0
+  ) {
+    return;
+  }
+  const duplicate = buffer.invocations.filter((record) =>
+    record.kind === "native" && record.turn === data.turn && record.step === data.step &&
+    record.invocationId === data.callId);
+  const record: InvocationRecord = {
+    kind: "native",
+    turn: data.turn,
+    step: data.step,
+    invocationId: data.callId,
+    toolName: data.name,
+    invalid: duplicate.length > 0,
+  };
+  for (const previous of duplicate) previous.invalid = true;
+  retainInvocation(buffer, record);
+}
+
+function observeNativeResult(
+  buffer: TurnBuffer,
+  data: { turn: number; step: number; message: { toolCallId: string; isError?: boolean }; error?: { code: string } },
+  sequence: number,
+  time: number,
+): void {
+  if (
+    data.turn !== buffer.turn || !Number.isSafeInteger(data.step) || data.step < 0 ||
+    typeof data.message?.toolCallId !== "string" || data.message.toolCallId.length === 0
+  ) {
+    return;
+  }
+  const matches = buffer.invocations.filter((record) =>
+    record.kind === "native" && record.turn === data.turn && record.step === data.step &&
+    record.invocationId === data.message.toolCallId);
+  if (matches.length !== 1) {
+    for (const record of matches) record.invalid = true;
+    return;
+  }
+  const record = matches[0]!;
+  if (record.invalid || record.outcome !== undefined) {
+    record.invalid = true;
+    return;
+  }
+  const timestamp = outcomeTimestamp(time);
+  const errorCode = data.error?.code;
+  if (typeof data.message.isError !== "boolean" || timestamp === null || !usableInvocationOutcome(data.message.isError, errorCode)) {
+    record.invalid = true;
+    return;
+  }
+  record.outcome = {
+    outcome: data.message.isError ? "failure" : "success",
+    sequence,
+    timestamp,
+  };
+}
+
+function observePtcStart(
+  buffer: TurnBuffer,
+  data: { rootCallId: string; parentCallId: string; subCallId: string; name: string },
+): void {
+  if (
+    typeof data.rootCallId !== "string" || data.rootCallId.length === 0 ||
+    typeof data.parentCallId !== "string" || data.parentCallId.length === 0 ||
+    typeof data.subCallId !== "string" || data.subCallId.length === 0 ||
+    typeof data.name !== "string" || data.name.length === 0
+  ) {
+    return;
+  }
+  // PTC events omit turn/step; the verified root call identity supplies both.
+  const parents = buffer.invocations.filter((record) =>
+    record.kind === "native" && record.turn === buffer.turn && record.invocationId === data.rootCallId);
+  if (parents.length !== 1 || parents[0]!.invalid) return;
+  const parent = parents[0]!;
+  const duplicate = buffer.invocations.filter((record) =>
+    record.kind === "ptc" && record.invocationId === data.subCallId);
+  const record: InvocationRecord = {
+    kind: "ptc",
+    turn: parent.turn,
+    step: parent.step,
+    invocationId: data.subCallId,
+    toolName: data.name,
+    rootCallId: data.rootCallId,
+    parentCallId: data.parentCallId,
+    invalid: duplicate.length > 0,
+  };
+  for (const previous of duplicate) previous.invalid = true;
+  retainInvocation(buffer, record);
+}
+
+function observePtcResult(
+  buffer: TurnBuffer,
+  data: {
+    rootCallId: string;
+    parentCallId: string;
+    subCallId: string;
+    name: string;
+    isError: boolean;
+    error?: { code: string };
+  },
+  sequence: number,
+  time: number,
+): void {
+  if (typeof data.subCallId !== "string" || data.subCallId.length === 0) return;
+  const matches = buffer.invocations.filter((record) =>
+    record.kind === "ptc" && record.invocationId === data.subCallId);
+  if (matches.length !== 1) {
+    for (const record of matches) record.invalid = true;
+    return;
+  }
+  const record = matches[0]!;
+  if (
+    record.invalid || record.outcome !== undefined ||
+    record.rootCallId !== data.rootCallId || record.parentCallId !== data.parentCallId ||
+    record.toolName !== data.name
+  ) {
+    record.invalid = true;
+    return;
+  }
+  const timestamp = outcomeTimestamp(time);
+  const errorCode = data.error?.code;
+  if (typeof data.isError !== "boolean" || timestamp === null || !usableInvocationOutcome(data.isError, errorCode)) {
+    record.invalid = true;
+    return;
+  }
+  record.outcome = {
+    outcome: data.isError ? "failure" : "success",
+    sequence,
+    timestamp,
+  };
+}
+
+function retainInvocation(buffer: TurnBuffer, record: InvocationRecord): void {
+  if (buffer.outcomeOverflowed) return;
+  if (buffer.invocations.length >= MAX_OUTCOME_INVOCATIONS_PER_TURN) {
+    buffer.outcomeOverflowed = true;
+    buffer.invocations = [];
+    return;
+  }
+  buffer.invocations.push(record);
+}
+
+function outcomeTimestamp(time: number): string | null {
+  if (!Number.isFinite(time)) return null;
+  const timestamp = new Date(time);
+  return Number.isFinite(timestamp.getTime()) ? timestamp.toISOString() : null;
+}
+
+function usableInvocationOutcome(isError: boolean, errorCode: string | undefined): boolean {
+  // An unclassified failure cannot prove the call was a registered tool invocation.
+  return errorCode !== "UNKNOWN_TOOL" && (!isError || (errorCode !== undefined && errorCode.length > 0));
+}
+
+function persistTurnCandidates(
+  repository: KnowledgeRepository,
+  input: { sessionId: string; scope: KnowledgeScope; snapshot: ExtractionSnapshot },
+): void {
+  const m4 = extractKnowledgeCandidates({
+    sessionId: input.sessionId,
+    scope: input.scope,
+    events: input.snapshot.events,
+  });
+  const m61 = input.sessionId.length <= MAX_LESSON_SESSION_ID_CHARS
+    ? extractLessonCandidatesWithActionReferences({
+        sessionId: input.sessionId,
+        scope: input.scope,
+        events: input.snapshot.events as readonly LessonExtractionEventReference[],
+      })
+    : { candidates: [], sensitiveCount: 0 };
+  const remaining = Math.max(0, MAX_CANDIDATES_PER_TURN - m4.candidates.length);
+  const lessons = m61.candidates.slice(0, remaining).map((candidate) =>
+    attachOutcomeEvidence(candidate, input.sessionId, input.snapshot));
+  const detection: KnowledgeDetectionResult = {
+    candidates: [...m4.candidates, ...lessons],
+    sensitiveCount: m4.sensitiveCount + m61.sensitiveCount,
+  };
+  admitAutomaticCandidates(repository, input.scope, detection);
+}
+
+function attachOutcomeEvidence(
+  candidate: LessonCandidateWithActionReference,
+  sessionId: string,
+  snapshot: ExtractionSnapshot,
+): KnowledgeCandidateProposal {
+  const step = snapshot.stepTrackingInvalid || snapshot.ambiguousMessageSequences.has(candidate.sequence)
+    ? undefined
+    : snapshot.stepByMessageSequence.get(candidate.sequence);
+  if (candidate.actionReference === undefined || step === undefined || snapshot.outcomeOverflowed) {
+    return candidate.proposal;
+  }
+  const matches = snapshot.invocations.filter((record) =>
+    record.turn === snapshot.turn && record.step === step && record.toolName === candidate.actionReference);
+  if (matches.length !== 1) return candidate.proposal;
+  const invocation = matches[0]!;
+  if (invocation.invalid || invocation.outcome === undefined) return candidate.proposal;
+  return {
+    ...candidate.proposal,
+    evidence: [...candidate.proposal.evidence, {
+      type: "session",
+      source: sessionId,
+      locator: `seq=${invocation.outcome.sequence}`,
+      timestamp: invocation.outcome.timestamp,
+    }],
   };
 }
 

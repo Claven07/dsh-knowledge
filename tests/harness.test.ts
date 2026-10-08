@@ -146,6 +146,332 @@ describe("DeepSeek Harness plugin adapters", () => {
     expect(listed.items[0]?.creationOrigin).toBe("automatic");
   });
 
+  describe("M6.3 supported outcome evidence", () => {
+    const lessonText = "Don't call legacy.ts directly; use modern.ts.";
+
+    it.each([
+      ["successful", false, undefined],
+      ["failed", true, "ABORTED"],
+    ] as const)("attaches one authoritative %s native invocation outcome", async (_label, isError, errorCode) => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, lessonText, (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", isError, next(), errorCode));
+      });
+
+      const candidate = automaticLessons(harness)[0];
+      expect(candidate).toMatchObject({
+        type: "lesson",
+        status: "candidate",
+        creationOrigin: "automatic",
+        content: lessonText,
+        evidence: [
+          { type: "session", source: "session-1", locator: "seq=1001" },
+          { type: "session", source: "session-1", locator: "seq=1004" },
+        ],
+      });
+      expect(candidate?.evidence[1]?.timestamp).toBe(new Date(extractionEventTime + 1_004).toISOString());
+      expect(JSON.stringify(candidate)).not.toContain("arguments");
+      expect(JSON.stringify(candidate)).not.toContain("sensitive result output");
+    });
+
+    it.each([
+      ["successful", false, undefined],
+      ["failed", true, "ABORTED"],
+    ] as const)("attaches one authoritative %s PTC subcall outcome", async (_label, isError, errorCode) => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, lessonText, (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, "root-1", "run_code", next()));
+        const startSequence = next();
+        emit(ptcStartEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", startSequence));
+        emit(ptcResultEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", isError, next(), errorCode));
+        emit(nativeToolResultEvent(turn, step, "root-1", false, next()));
+      });
+
+      expect(automaticLessons(harness)[0]?.evidence).toMatchObject([
+        { source: "session-1", locator: "seq=1001" },
+        { source: "session-1", locator: "seq=1005" },
+      ]);
+    });
+
+    it.each([
+      ["missing isError", (emit: EmitSessionEvent, next: NextSequence, turn: number, step: number) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", undefined, next()));
+      }],
+      ["mismatched callId", (emit: EmitSessionEvent, next: NextSequence, turn: number, step: number) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "other-call", false, next()));
+      }],
+      ["unknown tool", (emit: EmitSessionEvent, next: NextSequence, turn: number, step: number) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", true, next(), "UNKNOWN_TOOL"));
+      }],
+      ["duplicate invocation", (emit: EmitSessionEvent, next: NextSequence, turn: number, step: number) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", false, next()));
+      }],
+      ["multiple same-name calls", (emit: EmitSessionEvent, next: NextSequence, turn: number, step: number) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolCallEvent(turn, step, "native-2", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", false, next()));
+        emit(nativeToolResultEvent(turn, step, "native-2", false, next()));
+      }],
+      ["conflicting duplicate outcomes", (emit: EmitSessionEvent, next: NextSequence, turn: number, step: number) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", false, next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", true, next()));
+      }],
+      ["duplicate result events", (emit: EmitSessionEvent, next: NextSequence, turn: number, step: number) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", false, next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", false, next()));
+      }],
+    ] as const)("does not attach evidence for %s", async (_label, addEvents) => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, lessonText, addEvents);
+      expect(automaticLessons(harness)[0]?.evidence).toHaveLength(1);
+    });
+
+    it("pairs PTC results only by the same subCallId", async () => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, lessonText, (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, "root-1", "run_code", next()));
+        emit(ptcStartEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", next()));
+        emit(ptcResultEvent("root-1", "root-1", "root-1:ptc:other", "modern.ts", false, next()));
+        emit(nativeToolResultEvent(turn, step, "root-1", false, next()));
+      });
+      expect(automaticLessons(harness)[0]?.evidence).toHaveLength(1);
+    });
+
+    it.each([
+      ["duplicate PTC start event", (emit: EmitSessionEvent, next: NextSequence) => {
+        const start = ptcStartEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", next());
+        emit(start);
+        emit(start);
+        emit(ptcResultEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", false, next()));
+      }],
+      ["duplicate PTC result event", (emit: EmitSessionEvent, next: NextSequence) => {
+        emit(ptcStartEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", next()));
+        const result = ptcResultEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", false, next());
+        emit(result);
+        emit(result);
+      }],
+      ["conflicting duplicate PTC result", (emit: EmitSessionEvent, next: NextSequence) => {
+        emit(ptcStartEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", next()));
+        emit(ptcResultEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", false, next()));
+        emit(ptcResultEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", true, next(), "ABORTED"));
+      }],
+      ["wrong PTC rootCallId", (emit: EmitSessionEvent, next: NextSequence) => {
+        emit(ptcStartEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", next()));
+        emit(ptcResultEvent("other-root", "root-1", "root-1:ptc:1", "modern.ts", false, next()));
+      }],
+      ["wrong PTC parent ID", (emit: EmitSessionEvent, next: NextSequence) => {
+        emit(ptcStartEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", next()));
+        emit(ptcResultEvent("root-1", "other-parent", "root-1:ptc:1", "modern.ts", false, next()));
+      }],
+      ["wrong PTC tool name", (emit: EmitSessionEvent, next: NextSequence) => {
+        emit(ptcStartEvent("root-1", "root-1", "root-1:ptc:1", "modern.ts", next()));
+        emit(ptcResultEvent("root-1", "root-1", "root-1:ptc:1", "unrelated.ts", false, next()));
+      }],
+    ] as const)("does not attach outcome evidence for %s", async (_label, addEvents) => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, lessonText, (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, "root-1", "run_code", next()));
+        addEvents(emit, next);
+        emit(nativeToolResultEvent(turn, step, "root-1", false, next()));
+      });
+
+      const candidates = automaticLessons(harness);
+      expect(candidates).toHaveLength(1);
+      expect(candidates[0]).toMatchObject({
+        type: "lesson",
+        status: "candidate",
+        creationOrigin: "automatic",
+        content: lessonText,
+      });
+      expect(candidates[0]?.evidence).toEqual([{
+        type: "session",
+        source: "session-1",
+        locator: "seq=1001",
+        timestamp: new Date(extractionEventTime).toISOString(),
+      }]);
+    });
+
+    it("does not attach one call's failure to a different successful call", async () => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, lessonText, (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, "old-1", "legacy.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "old-1", true, next()));
+        emit(nativeToolCallEvent(turn, step, "other-1", "unrelated.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "other-1", false, next()));
+      });
+      expect(automaticLessons(harness)[0]?.evidence).toHaveLength(1);
+    });
+
+    it.each([
+      ["policy rejection without structured registration identity", undefined, 1],
+      ["cancellation", "ABORTED", 2],
+      ["timeout without structured registration identity", undefined, 1],
+      ["output validation failure", "INVALID_TOOL_OUTPUT", 2],
+    ] as const)("applies failure evidence rules to %s", async (_label, errorCode, evidenceCount) => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, lessonText, (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", true, next(), errorCode));
+      });
+      expect(automaticLessons(harness)[0]?.evidence).toHaveLength(evidenceCount);
+    });
+
+    it("uses isError instead of arbitrary tool output or assistant success claims", async () => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, lessonText, (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", true, next(), "ABORTED", "The operation succeeded."));
+      });
+      expect(automaticLessons(harness)[0]?.evidence).toHaveLength(2);
+      expect(JSON.stringify(automaticLessons(harness)[0])).not.toContain("The operation succeeded");
+
+      const assistantHarness = createPluginHarness({ automaticExtraction: true });
+      const assistantSession = makeSession("C:\\workspace");
+      await runLessonTurn(assistantHarness, assistantSession, lessonText, (emit, next, turn, step) => {
+        emit(assistantClaimEvent(turn, step, "The operation succeeded.", next()));
+      });
+      expect(automaticLessons(assistantHarness)[0]?.evidence).toHaveLength(1);
+    });
+
+    it("does not turn successful invocation output into project success", async () => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, lessonText, (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", false, next(), undefined, "The build failed."));
+      });
+      expect(automaticLessons(harness)[0]?.evidence).toHaveLength(2);
+      expect(automaticLessons(harness)[0]?.content).toBe(lessonText);
+    });
+
+    it("rejects bare outcomes and lessons with no action-reference identity", async () => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, "The request failed.", (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", true, next()));
+      });
+      expect(automaticLessons(harness)).toEqual([]);
+
+      const prerequisite = "This repository requires package.json before typecheck.";
+      await runLessonTurn(harness, session, prerequisite, (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, "native-2", "typecheck", next()));
+        emit(nativeToolResultEvent(turn, step, "native-2", false, next()));
+      }, 2, 1);
+      expect(automaticLessons(harness).find(({ content }) => content === prerequisite)?.evidence).toHaveLength(1);
+    });
+
+    it("does not correlate a matching tool in a different step or turn", async () => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, lessonText, (emit, next, turn, _step) => {
+        emit(stepEndEvent(turn, 0, next()));
+        emit(stepStartEvent(turn, 1, next()));
+        emit(nativeToolCallEvent(turn, 1, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, 1, "native-1", false, next()));
+        emit(stepEndEvent(turn, 1, next()));
+      });
+      expect(automaticLessons(harness)[0]?.evidence).toHaveLength(1);
+
+      await runLessonTurn(harness, session, lessonText, (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, `native-${turn}`, "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, `native-${turn}`, false, next()));
+      }, 2, 0);
+      expect(automaticLessons(harness).filter(({ content }) => content === lessonText)[0]?.evidence).toHaveLength(1);
+    });
+
+    it("disables outcome evidence for the whole turn after the ninth invocation", async () => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, lessonText, (emit, next, turn, step) => {
+        const calls = Array.from({ length: 9 }, (_, index) => `call-${index}`);
+        for (const callId of calls) emit(nativeToolCallEvent(turn, step, callId, callId === "call-0" ? "modern.ts" : `other-${callId}.ts`, next()));
+        for (const callId of calls) emit(nativeToolResultEvent(turn, step, callId, false, next()));
+      });
+      expect(automaticLessons(harness)[0]?.evidence).toHaveLength(1);
+    });
+
+    it("clears pending outcome records and queued candidates when the session is disposed", async () => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      const dispatch = harness.listeners.get("session/event")! as (session: Session, event: SessionEvent) => void;
+      let sequence = 1;
+      for (const event of [
+        turnStartEvent(1, sequence++),
+        userMessageEvent(lessonText, sequence++),
+        stepStartEvent(1, 0, sequence++),
+        nativeToolCallEvent(1, 0, "native-1", "modern.ts", sequence++),
+        nativeToolResultEvent(1, 0, "native-1", false, sequence++),
+        stepEndEvent(1, 0, sequence++),
+        turnEndEvent(1, sequence++),
+      ]) dispatch(session, event);
+      const disposed = harness.listeners.get("session/disposed")! as (session: Session) => void;
+      disposed(session);
+      await flushExtraction();
+      expect(automaticLessons(harness)).toEqual([]);
+    });
+
+    it("keeps M4 proposal priority and lets M6.1 use remaining capacity", async () => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      const m4a = "We decided to use PostgreSQL for the project database.";
+      const m4b = "We decided to use SQLite for the local cache.";
+      const listener = harness.listeners.get("session/event")! as (session: Session, event: SessionEvent) => void;
+      listener(session, turnStartEvent(1, 100));
+      listener(session, userMessageEvent(m4a, 101));
+      listener(session, userMessageEvent(m4b, 102));
+      listener(session, userMessageEvent(lessonText, 103));
+      listener(session, stepStartEvent(1, 0, 104));
+      listener(session, nativeToolCallEvent(1, 0, "native-1", "modern.ts", 105));
+      listener(session, nativeToolResultEvent(1, 0, "native-1", false, 106));
+      listener(session, stepEndEvent(1, 0, 107));
+      listener(session, turnEndEvent(1, 108));
+      await flushExtraction();
+      expect(automaticCandidates(harness).map(({ content }) => content).sort()).toEqual([m4a, m4b].sort());
+
+      const partial = createPluginHarness({ automaticExtraction: true });
+      const partialSession = makeSession("C:\\workspace");
+      await runLessonTurn(partial, partialSession, lessonText, (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", false, next()));
+      }, 1, 1, ["We decided to use PostgreSQL for the project database."]);
+      expect(automaticCandidates(partial).map(({ type }) => type).sort()).toEqual(["decision", "lesson"]);
+      expect(automaticLessons(partial)[0]?.evidence).toHaveLength(2);
+    });
+
+    it("keeps outcome-supported automatic candidates excluded from M2 retrieval", async () => {
+      const harness = createPluginHarness({ automaticExtraction: true });
+      const session = makeSession("C:\\workspace");
+      await runLessonTurn(harness, session, lessonText, (emit, next, turn, step) => {
+        emit(nativeToolCallEvent(turn, step, "native-1", "modern.ts", next()));
+        emit(nativeToolResultEvent(turn, step, "native-1", false, next()));
+      });
+      const candidate = automaticLessons(harness)[0]!;
+      const retrieved = retrieveRelevantKnowledge(
+        openRepository(harness.path),
+        "modern.ts",
+        { workspace: "C:\\workspace", project: undefined },
+      );
+      expect(retrieved.map(({ knowledge }) => knowledge.id)).not.toContain(candidate.id);
+    });
+  });
+
   it("does not retain queued extraction work after session disposal", async () => {
     const harness = createPluginHarness({ automaticExtraction: true });
     const session = makeSession("C:\\workspace");
@@ -2152,6 +2478,171 @@ function emitTurn(
   listener(session, turnStartEvent(turn, turn * 3));
   listener(session, userMessageEvent(text, turn * 3 + 1, sourceKind));
   listener(session, turnEndEvent(turn, turn * 3 + 2));
+}
+
+type EmitSessionEvent = (event: SessionEvent) => void;
+type NextSequence = () => number;
+type LessonTurnEvents = (
+  emit: EmitSessionEvent,
+  next: NextSequence,
+  turn: number,
+  step: number,
+) => void;
+
+async function runLessonTurn(
+  harness: PluginHarness,
+  session: Session,
+  text: string,
+  addEvents: LessonTurnEvents,
+  turn = 1,
+  step = 0,
+  additionalTexts: readonly string[] = [],
+): Promise<void> {
+  const dispatch = harness.listeners.get("session/event")! as (session: Session, event: SessionEvent) => void;
+  let sequence = turn * 1_000;
+  const next = (): number => sequence++;
+  let activeStep: number | undefined;
+  const emit: EmitSessionEvent = (event) => {
+    dispatch(session, event);
+    if (event.type === "step/start") activeStep = event.data.step;
+    if (event.type === "step/end") activeStep = undefined;
+  };
+
+  emit(turnStartEvent(turn, next()));
+  emit(userMessageEvent(text, next()));
+  for (const additionalText of additionalTexts) emit(userMessageEvent(additionalText, next()));
+  emit(stepStartEvent(turn, step, next()));
+  addEvents(emit, next, turn, step);
+  if (activeStep !== undefined) emit(stepEndEvent(turn, activeStep, next()));
+  emit(turnEndEvent(turn, next()));
+  await flushExtraction();
+}
+
+async function flushExtraction(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function automaticLessons(harness: PluginHarness): Knowledge[] {
+  return automaticCandidates(harness).filter(({ type }) => type === "lesson");
+}
+
+function automaticCandidates(harness: PluginHarness): Knowledge[] {
+  return openRepository(harness.path).list({
+    workspace: "C:\\workspace",
+    status: "candidate",
+    creationOrigin: "automatic",
+  });
+}
+
+function nativeToolCallEvent(turn: number, step: number, callId: string, name: string, sequence: number): SessionEvent {
+  return {
+    type: "tool/call",
+    seq: sequence as SessionEvent<"tool/call">["seq"],
+    time: extractionEventTime + sequence,
+    data: { turn, step, callId: callId as never, name, arguments: "sensitive invocation arguments" },
+  } as unknown as SessionEvent;
+}
+
+function nativeToolResultEvent(
+  turn: number,
+  step: number,
+  callId: string,
+  isError: boolean | undefined,
+  sequence: number,
+  errorCode?: string,
+  output = "sensitive result output",
+): SessionEvent {
+  const message = {
+    role: "tool",
+    source: { kind: "tool", callId },
+    toolCallId: callId,
+    content: [{ type: "text", text: output }],
+    ...(isError === undefined ? {} : { isError }),
+  };
+  return {
+    type: "tool/result",
+    seq: sequence as SessionEvent<"tool/result">["seq"],
+    time: extractionEventTime + sequence,
+    data: {
+      turn,
+      step,
+      message,
+      ...(errorCode === undefined ? {} : { error: { name: "HarnessError", code: errorCode, reason: "private error reason" } }),
+    },
+    surfaceOp: "append",
+  } as unknown as SessionEvent;
+}
+
+function ptcStartEvent(
+  rootCallId: string,
+  parentCallId: string,
+  subCallId: string,
+  name: string,
+  sequence: number,
+): SessionEvent {
+  return {
+    type: "tool/ptc-dispatch-start",
+    seq: sequence as SessionEvent["seq"],
+    time: extractionEventTime + sequence,
+    data: { rootCallId, parentCallId, subCallId, name, arguments: { secret: "not retained" } },
+  } as unknown as SessionEvent;
+}
+
+function ptcResultEvent(
+  rootCallId: string,
+  parentCallId: string,
+  subCallId: string,
+  name: string,
+  isError: boolean,
+  sequence: number,
+  errorCode?: string,
+): SessionEvent {
+  return {
+    type: "tool/ptc-dispatch",
+    seq: sequence as SessionEvent["seq"],
+    time: extractionEventTime + sequence,
+    data: {
+      rootCallId,
+      parentCallId,
+      subCallId,
+      name,
+      isError,
+      content: [{ type: "text", text: "private subcall output" }],
+      ...(errorCode === undefined ? {} : { error: { name: "HarnessError", code: errorCode, reason: "private error reason" } }),
+    },
+  } as unknown as SessionEvent;
+}
+
+function assistantClaimEvent(turn: number, step: number, text: string, sequence: number): SessionEvent {
+  return {
+    type: "assistant/message",
+    seq: sequence as SessionEvent<"assistant/message">["seq"],
+    time: extractionEventTime + sequence,
+    data: {
+      turn,
+      step,
+      message: { role: "assistant", source: { kind: "model", provider: "test", model: "test" }, content: [{ type: "text", text }] },
+      stream: [],
+    },
+  } as unknown as SessionEvent;
+}
+
+function stepStartEvent(turn: number, step: number, sequence: number): SessionEvent {
+  return {
+    type: "step/start",
+    seq: sequence as SessionEvent<"step/start">["seq"],
+    time: extractionEventTime + sequence,
+    data: { turn, step },
+  };
+}
+
+function stepEndEvent(turn: number, step: number, sequence: number): SessionEvent {
+  return {
+    type: "step/end",
+    seq: sequence as SessionEvent<"step/end">["seq"],
+    time: extractionEventTime + sequence,
+    data: { turn, step },
+  };
 }
 
 function turnStartEvent(turn: number, sequence: number): SessionEvent {

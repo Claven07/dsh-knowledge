@@ -9,6 +9,7 @@ import {
 } from "./extraction.js";
 import type {
   ExtractionEventReference,
+  KnowledgeCandidateProposal,
   KnowledgeDetectionResult,
   KnowledgeExtractionInput,
 } from "./extraction.js";
@@ -30,7 +31,20 @@ export type LessonExtractionInput =
     readonly events: readonly LessonExtractionEventReference[];
   };
 
-const MAX_SESSION_ID_CHARS = 128;
+/** @internal Transient grammar metadata for Harness outcome association. */
+export type LessonCandidateWithActionReference = Readonly<{
+  proposal: KnowledgeCandidateProposal;
+  sequence: number;
+  actionReference?: string;
+}>;
+
+/** @internal Extended detector result; action references are never persisted. */
+export type LessonCorrelationDetectionResult = Readonly<{
+  candidates: readonly LessonCandidateWithActionReference[];
+  sensitiveCount: number;
+}>;
+
+export const MAX_LESSON_SESSION_ID_CHARS = 128;
 const MAX_REFERENCE_SPANS = 4;
 const WEAK_LANGUAGE = /\b(?:maybe|perhaps|probably|possibly|potentially|might|could|someday|prefer|preferred|favorite|currently|temporarily|temporary|(?:for|in) (?:this|the current) (?:task|run|session|attempt|turn|change)|until|today)\b/i;
 // Match whole qualifiers, including spaced/hyphenated phrases, without matching named-reference substrings.
@@ -51,11 +65,26 @@ const REFERENCE_WORD = /^(?:the|this|our|a|an|direct|directly|calls?|schema|sour
  * No outcome or causal fact is inferred, and no input text is logged.
  */
 export function extractLessonCandidates(input: LessonExtractionInput): KnowledgeDetectionResult {
+  const detection = extractLessonCandidatesWithActionReferences(input);
+  return {
+    candidates: detection.candidates.map(({ proposal }) => proposal),
+    sensitiveCount: detection.sensitiveCount,
+  };
+}
+
+/**
+ * Runs the same M6.1 detector and additionally exposes its grammar-selected
+ * action reference for transient Harness correlation. It does not broaden
+ * acceptance and never copies assertion metadata into a proposal.
+ */
+export function extractLessonCandidatesWithActionReferences(
+  input: LessonExtractionInput,
+): LessonCorrelationDetectionResult {
   validateExtractionInput(input);
-  if (input.sessionId.length > MAX_SESSION_ID_CHARS) {
+  if (input.sessionId.length > MAX_LESSON_SESSION_ID_CHARS) {
     throw new RangeError("Lesson session ID exceeds the reference limit.");
   }
-  const candidates: KnowledgeDetectionResult["candidates"] = [];
+  const candidates: LessonCandidateWithActionReference[] = [];
   let sensitiveCount = 0;
   let characters = 0;
   const sensitiveSession = containsSensitiveContent(input.sessionId);
@@ -78,12 +107,13 @@ export function extractLessonCandidates(input: LessonExtractionInput): Knowledge
     if (
       content.length < 12 || content.length > MAX_CANDIDATE_CONTENT_CHARS ||
       content.includes("?") || WEAK_LANGUAGE.test(language) || ONE_OFF_LANGUAGE.test(language) ||
-      INFRASTRUCTURE.test(content) || RAW_TEXT.test(content) ||
-      !isDurableLesson(content, event.text, event.referenceSpans)
+      INFRASTRUCTURE.test(content) || RAW_TEXT.test(content)
     ) {
       continue;
     }
-    candidates.push({
+    const actionReference = acceptedActionReference(content, event.text, event.referenceSpans);
+    if (actionReference === null) continue;
+    const proposal: KnowledgeCandidateProposal = {
       type: "lesson",
       content,
       evidence: [{
@@ -92,47 +122,64 @@ export function extractLessonCandidates(input: LessonExtractionInput): Knowledge
         locator: "seq=" + event.sequence,
         timestamp: event.timestamp,
       }],
+    };
+    candidates.push({
+      proposal,
+      sequence: event.sequence,
+      ...(actionReference === undefined ? {} : { actionReference }),
     });
     if (candidates.length === MAX_CANDIDATES_PER_TURN) break;
   }
   return { candidates, sensitiveCount };
 }
 
-function isDurableLesson(content: string, text: string, metadata: unknown): boolean {
+function acceptedActionReference(content: string, text: string, metadata: unknown): string | undefined | null {
   const spans = validateReferenceSpans(text, metadata);
-  if (spans === null) return false;
+  if (spans === null) return null;
   // These changes are for matching only; stored content retains the user's wording.
   const withoutEnding = content.replace(/[.!]$/, "").trimEnd();
   const prefixLength = withoutEnding.match(/^(?:correction|actually|no)[,:]\s*/i)?.[0].length ?? 0;
   const statement = withoutEnding.slice(prefixLength);
   const offset = text.length - text.trimStart().length + prefixLength;
   const prohibition = statement.match(/^(?:don't|do not|never)\s+(?:call|use|invoke|run)\s+(.+?)[;.]\s*(?:use|call|run)\s+(.+)$/di);
-  if (prohibition !== null) return isContrast(prohibition, offset, spans);
+  if (prohibition !== null) return contrastActionReference(prohibition, 2, offset, spans);
   const instead = statement.match(/^instead of (?:using|calling|running)\s+(.+?),\s*(?:use|call|run)\s+(.+)$/di);
-  if (instead !== null) return isContrast(instead, offset, spans);
+  if (instead !== null) return contrastActionReference(instead, 2, offset, spans);
   const wrong = statement.match(/^(.+?) is (?:wrong|incorrect) here[;.]\s*(?:use|call|run)\s+(.+)$/di);
-  if (wrong !== null) return isContrast(wrong, offset, spans);
+  if (wrong !== null) return contrastActionReference(wrong, 2, offset, spans);
   const replacement = statement.match(/^(?:always\s+)?(?:use|call|run)\s+(.+?)\s+(?:instead of|rather than)\s+(?:(?:using|calling|running)\s+)?(.+)$/di);
-  if (replacement !== null) return isContrast(replacement, offset, spans);
+  if (replacement !== null) return contrastActionReference(replacement, 1, offset, spans);
   const constraint = statement.match(/^(?:provider selection|routing|(?:this|the|our) (?:project|repository|repo)) must (?:use|call|route through)\s+(.+?)\s+(?:instead of|rather than)\s+(?:(?:using|calling)\s+)?(.+)$/di);
-  if (constraint !== null) return isContrast(constraint, offset, spans);
+  if (constraint !== null) return contrastActionReference(constraint, 1, offset, spans);
 
   const prerequisite = statement.match(/^(?:this|the|our) (?:repository|repo|project) requires\s+(.+?)\s+before\s+(.+)$/di)
     ?? statement.match(/^run\s+(.+?)\s+before\s+(.+?)\s+in (?:this|the|our) (?:project|repository|repo)$/di);
   if (prerequisite !== null) {
-    return areConcreteReferences(prerequisite, offset, spans) &&
-      referenceKey(prerequisite[1]!) !== referenceKey(prerequisite[2]!);
+    const references = concreteReferences(prerequisite, offset, spans);
+    return references !== null &&
+      referenceKey(prerequisite[1]!) !== referenceKey(prerequisite[2]!)
+      ? undefined
+      : null;
   }
 
   const causal = statement.match(/^(.+?) (?:fails?|breaks?) (?:when|because)\s+(.+?) (?:is|are) (?:omitted|missing)[;.]\s*(?:include|add|restore|enable|run)\s+(.+?)(?:\s+before\s+(.+))?$/di);
-  return causal !== null &&
-    areConcreteReferences(causal, offset, spans) &&
-    referenceKey(causal[2]!) === referenceKey(causal[3]!);
+  if (causal === null) return null;
+  const references = concreteReferences(causal, offset, spans);
+  return references !== null && referenceKey(causal[2]!) === referenceKey(causal[3]!)
+    ? references[3]
+    : null;
 }
 
-function isContrast(match: RegExpMatchArray, offset: number, spans: readonly LessonReferenceSpan[]): boolean {
-  return areConcreteReferences(match, offset, spans) &&
-    referenceKey(match[1]!) !== referenceKey(match[2]!);
+function contrastActionReference(
+  match: RegExpMatchArray,
+  actionSlot: number,
+  offset: number,
+  spans: readonly LessonReferenceSpan[],
+): string | null {
+  const references = concreteReferences(match, offset, spans);
+  return references !== null && referenceKey(match[1]!) !== referenceKey(match[2]!)
+    ? references[actionSlot]!
+    : null;
 }
 
 function validateReferenceSpans(text: string, value: unknown): readonly LessonReferenceSpan[] | null {
@@ -162,33 +209,40 @@ function splitsSurrogatePair(text: string, offset: number): boolean {
   return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
 }
 
-function areConcreteReferences(
+function concreteReferences(
   match: RegExpMatchArray,
   offset: number,
   spans: readonly LessonReferenceSpan[],
-): boolean {
+): readonly (string | undefined)[] | null {
   const asserted = new Set<number>();
+  const identities: Array<string | undefined> = [];
   for (const span of spans) {
     let capture: number | undefined;
     for (let index = 1; index < match.length; index += 1) {
       const range = match.indices![index];
       if (range !== undefined && span.start >= offset + range[0] && span.end <= offset + range[1]) {
-        if (capture !== undefined) return false;
+        if (capture !== undefined) return null;
         capture = index;
       }
     }
-    if (capture === undefined || asserted.has(capture)) return false;
+    if (capture === undefined || asserted.has(capture)) return null;
     const range = match.indices![capture]!;
     const value = match[capture]!;
     const start = span.start - offset - range[0];
     const end = span.end - offset - range[0];
     if (!REFERENCE_SURFACE.test(value.slice(start, end)) ||
         (start > 0 && ATOM_CHARACTER.test(value[start - 1]!)) ||
-        (end < value.length && ATOM_CHARACTER.test(value[end]!))) return false;
+        (end < value.length && ATOM_CHARACTER.test(value[end]!))) return null;
     asserted.add(capture);
+    identities[capture] = value.slice(start, end).trim();
   }
-  return match.slice(1).every((value, index) =>
-    value === undefined || isConcrete(value, asserted.has(index + 1)));
+  for (let index = 1; index < match.length; index += 1) {
+    const value = match[index];
+    if (value === undefined) continue;
+    if (!isConcrete(value, asserted.has(index))) return null;
+    if (identities[index] === undefined) identities[index] = value.trim();
+  }
+  return identities;
 }
 
 function isConcrete(value: string, asserted: boolean): boolean {
