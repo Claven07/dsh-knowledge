@@ -1,5 +1,6 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { Session, SessionEvent } from "@deepseek-ai/dsh-session";
+import type { ToolExecution, ToolExecutionToken } from "@deepseek-ai/dsh-tools";
 import {
   MAX_CANDIDATES_PER_TURN,
   MAX_EXTRACTION_EVENT_CHARS,
@@ -40,6 +41,15 @@ type TurnBuffer = {
   scope: KnowledgeScope | null;
   events: ExtractionEventReference[];
   characters: number;
+};
+
+type ExtractionSnapshot = Readonly<{
+  turn: number;
+  events: readonly ExtractionEventReference[];
+}>;
+
+// Dormant M6.3 types: the active adapter never constructs outcome state.
+type DormantOutcomeBuffer = TurnBuffer & {
   activeStep?: number;
   pendingMessageSequences: number[];
   stepByMessageSequence: Map<number, number>;
@@ -63,13 +73,13 @@ type InvocationRecord = {
   toolName: string;
   rootCallId?: string;
   parentCallId?: string;
+  executionToken?: ToolExecutionToken;
+  registrationProven: boolean;
   outcome?: InvocationOutcome;
   invalid: boolean;
 };
 
-type ExtractionSnapshot = Readonly<{
-  turn: number;
-  events: readonly ExtractionEventReference[];
+type DormantOutcomeSnapshot = ExtractionSnapshot & Readonly<{
   stepByMessageSequence: ReadonlyMap<number, number>;
   ambiguousMessageSequences: ReadonlySet<number>;
   stepTrackingInvalid: boolean;
@@ -337,6 +347,12 @@ export function observeKnowledgeExtraction(
     throw error;
   }
 
+  // M6.3 is dormant: no provider hooks or outcome-event observers are installed.
+  // Harness 0.2.0-rc.2 cannot bind an execution token to its originating
+  // turn/step and durable result. Activation requires an explicit source change
+  // after an authoritative upstream contract is verified. This containment
+  // neither inventories nor modifies previously persisted outcome evidence.
+
   function observeEvent(session: Session, event: SessionEvent): void {
     if (disposed) {
       return;
@@ -347,43 +363,12 @@ export function observeKnowledgeExtraction(
         scope: scopeFor(session, options.project),
         events: [],
         characters: 0,
-        pendingMessageSequences: [],
-        stepByMessageSequence: new Map(),
-        ambiguousMessageSequences: new Set(),
-        stepTrackingInvalid: false,
-        invocations: [],
-        outcomeOverflowed: false,
       });
       return;
     }
 
     const buffer = buffers.get(session);
     if (buffer === undefined) {
-      return;
-    }
-
-    if (event.type === "step/start") {
-      observeStepStart(buffer, event.data.turn, event.data.step);
-      return;
-    }
-    if (event.type === "step/end") {
-      observeStepEnd(buffer, event.data.turn, event.data.step);
-      return;
-    }
-    if (event.type === "tool/call") {
-      observeNativeCall(buffer, event.data);
-      return;
-    }
-    if (event.type === "tool/result") {
-      observeNativeResult(buffer, event.data, event.seq, event.time);
-      return;
-    }
-    if (event.type === "tool/ptc-dispatch-start") {
-      observePtcStart(buffer, event.data);
-      return;
-    }
-    if (event.type === "tool/ptc-dispatch") {
-      observePtcResult(buffer, event.data, event.seq, event.time);
       return;
     }
 
@@ -411,7 +396,6 @@ export function observeKnowledgeExtraction(
         author: "human",
         text,
       });
-      observeUserMessageStep(buffer, event.seq);
       buffer.characters += text.length;
       return;
     }
@@ -435,11 +419,6 @@ export function observeKnowledgeExtraction(
     const snapshot: ExtractionSnapshot = {
       turn: buffer.turn,
       events: buffer.events,
-      stepByMessageSequence: new Map(buffer.stepByMessageSequence),
-      ambiguousMessageSequences: new Set(buffer.ambiguousMessageSequences),
-      stepTrackingInvalid: buffer.stepTrackingInvalid,
-      invocations: buffer.outcomeOverflowed ? [] : buffer.invocations.map((record) => ({ ...record })),
-      outcomeOverflowed: buffer.outcomeOverflowed,
     };
     const job: ExtractionJob = {
       owner,
@@ -506,7 +485,9 @@ export function observeKnowledgeExtraction(
   };
 }
 
-function observeStepStart(buffer: TurnBuffer, turn: number, step: number): void {
+// Dormant M6.3 implementation. These unexported helpers have no callers in the
+// active adapter or admission path; their old correlation is not safe to enable.
+function observeStepStart(buffer: DormantOutcomeBuffer, turn: number, step: number): void {
   if (turn !== buffer.turn || !Number.isSafeInteger(step) || step < 0) {
     buffer.stepTrackingInvalid = true;
     return;
@@ -530,7 +511,7 @@ function observeStepStart(buffer: TurnBuffer, turn: number, step: number): void 
   buffer.pendingMessageSequences = [];
 }
 
-function observeStepEnd(buffer: TurnBuffer, turn: number, step: number): void {
+function observeStepEnd(buffer: DormantOutcomeBuffer, turn: number, step: number): void {
   if (turn !== buffer.turn || buffer.activeStep !== step) {
     buffer.stepTrackingInvalid = true;
     buffer.activeStep = undefined;
@@ -540,7 +521,7 @@ function observeStepEnd(buffer: TurnBuffer, turn: number, step: number): void {
   buffer.activeStep = undefined;
 }
 
-function observeUserMessageStep(buffer: TurnBuffer, sequence: number): void {
+function observeUserMessageStep(buffer: DormantOutcomeBuffer, sequence: number): void {
   if (buffer.stepTrackingInvalid) return;
   if (buffer.stepByMessageSequence.has(sequence) || buffer.pendingMessageSequences.includes(sequence)) {
     buffer.ambiguousMessageSequences.add(sequence);
@@ -556,7 +537,7 @@ function observeUserMessageStep(buffer: TurnBuffer, sequence: number): void {
 }
 
 function observeNativeCall(
-  buffer: TurnBuffer,
+  buffer: DormantOutcomeBuffer,
   data: { turn: number; step: number; callId: string; name: string },
 ): void {
   if (
@@ -575,6 +556,7 @@ function observeNativeCall(
     step: data.step,
     invocationId: data.callId,
     toolName: data.name,
+    registrationProven: false,
     invalid: duplicate.length > 0,
   };
   for (const previous of duplicate) previous.invalid = true;
@@ -582,7 +564,7 @@ function observeNativeCall(
 }
 
 function observeNativeResult(
-  buffer: TurnBuffer,
+  buffer: DormantOutcomeBuffer,
   data: { turn: number; step: number; message: { toolCallId: string; isError?: boolean }; error?: { code: string } },
   sequence: number,
   time: number,
@@ -607,7 +589,7 @@ function observeNativeResult(
   }
   const timestamp = outcomeTimestamp(time);
   const errorCode = data.error?.code;
-  if (typeof data.message.isError !== "boolean" || timestamp === null || !usableInvocationOutcome(data.message.isError, errorCode)) {
+  if (typeof data.message.isError !== "boolean" || timestamp === null || !usableInvocationOutcome(record, errorCode)) {
     record.invalid = true;
     return;
   }
@@ -619,7 +601,7 @@ function observeNativeResult(
 }
 
 function observePtcStart(
-  buffer: TurnBuffer,
+  buffer: DormantOutcomeBuffer,
   data: { rootCallId: string; parentCallId: string; subCallId: string; name: string },
 ): void {
   if (
@@ -645,6 +627,7 @@ function observePtcStart(
     toolName: data.name,
     rootCallId: data.rootCallId,
     parentCallId: data.parentCallId,
+    registrationProven: false,
     invalid: duplicate.length > 0,
   };
   for (const previous of duplicate) previous.invalid = true;
@@ -652,7 +635,7 @@ function observePtcStart(
 }
 
 function observePtcResult(
-  buffer: TurnBuffer,
+  buffer: DormantOutcomeBuffer,
   data: {
     rootCallId: string;
     parentCallId: string;
@@ -682,7 +665,7 @@ function observePtcResult(
   }
   const timestamp = outcomeTimestamp(time);
   const errorCode = data.error?.code;
-  if (typeof data.isError !== "boolean" || timestamp === null || !usableInvocationOutcome(data.isError, errorCode)) {
+  if (typeof data.isError !== "boolean" || timestamp === null || !usableInvocationOutcome(record, errorCode)) {
     record.invalid = true;
     return;
   }
@@ -693,7 +676,7 @@ function observePtcResult(
   };
 }
 
-function retainInvocation(buffer: TurnBuffer, record: InvocationRecord): void {
+function retainInvocation(buffer: DormantOutcomeBuffer, record: InvocationRecord): void {
   if (buffer.outcomeOverflowed) return;
   if (buffer.invocations.length >= MAX_OUTCOME_INVOCATIONS_PER_TURN) {
     buffer.outcomeOverflowed = true;
@@ -709,9 +692,47 @@ function outcomeTimestamp(time: number): string | null {
   return Number.isFinite(timestamp.getTime()) ? timestamp.toISOString() : null;
 }
 
-function usableInvocationOutcome(isError: boolean, errorCode: string | undefined): boolean {
-  // An unclassified failure cannot prove the call was a registered tool invocation.
-  return errorCode !== "UNKNOWN_TOOL" && (!isError || (errorCode !== undefined && errorCode.length > 0));
+function observeInvocationRegistration(
+  buffer: DormantOutcomeBuffer,
+  exec: Readonly<ToolExecution>,
+  isRegistered: () => boolean,
+): void {
+  if (buffer.outcomeOverflowed || buffer.activeStep === undefined || typeof exec.token !== "symbol") return;
+  const kind = exec.parent === undefined ? "native" : "ptc";
+  const matches = buffer.invocations.filter((record) =>
+    record.kind === kind && record.turn === buffer.turn && record.step === buffer.activeStep &&
+    record.invocationId === exec.callId);
+  if (matches.length !== 1) {
+    for (const record of matches) record.invalid = true;
+    return;
+  }
+  const record = matches[0]!;
+  if (
+    record.invalid || record.executionToken !== undefined || record.outcome !== undefined ||
+    record.toolName !== exec.name ||
+    (kind === "native" ? exec.rootCallId !== exec.callId : record.rootCallId !== exec.rootCallId)
+  ) {
+    record.invalid = true;
+    return;
+  }
+  record.executionToken = exec.token;
+  if (kind === "ptc") {
+    const parents = buffer.invocations.filter((parent) =>
+      parent.turn === record.turn && parent.step === record.step &&
+      parent.invocationId === record.parentCallId && parent.executionToken === exec.parent &&
+      (parent.kind === "native" ? parent.invocationId : parent.rootCallId) === record.rootCallId);
+    if (parents.length !== 1 || parents[0]!.invalid || !parents[0]!.registrationProven) {
+      record.invalid = true;
+      return;
+    }
+  }
+  // Historical availability check only: this does not establish the execution's
+  // originating turn/step or bind its token to a durable result.
+  record.registrationProven = isRegistered();
+}
+
+function usableInvocationOutcome(record: InvocationRecord, errorCode: string | undefined): boolean {
+  return record.registrationProven && errorCode !== "UNKNOWN_TOOL";
 }
 
 function persistTurnCandidates(
@@ -732,7 +753,7 @@ function persistTurnCandidates(
     : { candidates: [], sensitiveCount: 0 };
   const remaining = Math.max(0, MAX_CANDIDATES_PER_TURN - m4.candidates.length);
   const lessons = m61.candidates.slice(0, remaining).map((candidate) =>
-    attachOutcomeEvidence(candidate, input.sessionId, input.snapshot));
+    candidate.proposal);
   const detection: KnowledgeDetectionResult = {
     candidates: [...m4.candidates, ...lessons],
     sensitiveCount: m4.sensitiveCount + m61.sensitiveCount,
@@ -740,10 +761,11 @@ function persistTurnCandidates(
   admitAutomaticCandidates(repository, input.scope, detection);
 }
 
+// Dormant M6.3 attachment; never called by automatic candidate admission.
 function attachOutcomeEvidence(
   candidate: LessonCandidateWithActionReference,
   sessionId: string,
-  snapshot: ExtractionSnapshot,
+  snapshot: DormantOutcomeSnapshot,
 ): KnowledgeCandidateProposal {
   const step = snapshot.stepTrackingInvalid || snapshot.ambiguousMessageSequences.has(candidate.sequence)
     ? undefined
