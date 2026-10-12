@@ -1,59 +1,135 @@
 # DSH Knowledge Core
 
-`DSH Knowledge Core` is a local, evidence-backed project knowledge layer for coding agents. It stores durable project facts, engineering decisions, and lessons in SQLite, with explicit workspace/project scope and lifecycle status.
+A local, evidence-backed project knowledge layer for coding agents.
 
-Ordinary chat memory often retains conversational details without showing what a statement describes or where it came from. `DSH Knowledge Core` keeps evidence as first-class records. Explicit entries use caller-supplied evidence; opt-in M4 extraction attaches bounded session evidence to automatic candidates.
+## Overview
 
-## Status
+Coding agents need project context that survives a conversation: architectural decisions, repository facts, and lessons worth keeping. DSH Knowledge Core stores that context in SQLite, with workspace/project scope, lifecycle status, and references to the evidence behind each entry.
 
-M0 core storage, M1 native DeepSeek Harness tools, M2 deterministic ranked retrieval, and M3 Git provenance with on-demand freshness checks are implemented. **The Harness adapter remains the separate `dsh-knowledge/plugin` entry point.** Storage, retrieval, Git provenance, and freshness APIs remain usable without DeepSeek Harness.
+Records can reference files, Git snapshots, or sessions. Deterministic retrieval selects relevant knowledge, while on-demand Git checks help identify evidence that has changed. Use the core as an ESM library or connect it to DeepSeek Harness through the optional adapter.
 
-## Capabilities
+## Key features
 
-- Local SQLite storage through `better-sqlite3`; no ORM or remote service.
-- Create, get, list, deterministic `LIKE` search, update, archive, and supersede knowledge through the core repository.
-- Normalized evidence records and workspace/project scope.
-- Seven DSH tools: `knowledge_add`, `knowledge_search`, `knowledge_list`, `knowledge_get`, `knowledge_archive`, `knowledge_check_freshness`, and `knowledge_health`.
-- `knowledge_add` opportunistically attaches the current commit and repository-relative path to clean, committed file evidence in the active session workspace.
-- `knowledge_check_freshness` compares Git-backed file evidence with the current repository snapshot without modifying knowledge or Git state.
-- Session evidence on explicit tool-created items when DSH provides a calling agent/session.
-- The model-facing `knowledge_add` tool filters common secret patterns in content and evidence source/locator fields; this is not comprehensive scanning, and the trusted core repository does not scan secrets.
-- Bounded `agent/pre-step` retrieval from the current workspace and optional configured project. It ranks relevant project entries before workspace-wide entries, prefers verified entries at equal scope, excludes archived/superseded entries, suppresses conservative near-duplicates, and injects compact context only.
-- Retrieval/storage failures are logged and do not stop agent execution.
+- **Local storage:** SQLite persistence through `better-sqlite3`, with automatic schema migrations.
+- **Scoped records:** Facts, decisions, and lessons organized by workspace and optional project, with file, Git, or session evidence.
+- **Explicit lifecycle:** Create, update, verify, archive, and supersede records through the repository API.
+- **Deterministic retrieval:** Ranked lexical matching with score explanations and conservative duplicate suppression; literal search is also available.
+- **Git provenance and freshness:** Capture clean, committed file references and compare their snapshots against the current repository.
+- **Knowledge health:** Inspect one record or a batch of up to 16 records without changing stored knowledge.
+- **Optional candidate extraction:** Conservative rules extract candidates from direct user messages in Harness.
+- **Harness tools and context:** Seven knowledge tools and bounded retrieval before agent steps.
 
-There is no automatic LLM extraction, embeddings, vector search, external API, HTTP server, or UI. Git inspection is local and read-only; the plugin never fetches or contacts a remote.
+## Architecture
 
-## Installation
+```mermaid
+flowchart TD
+    Harness["DeepSeek Harness tools and hooks"] --> Adapter["DSH adapter"]
+    Adapter --> Repository["KnowledgeRepository"]
+    Application["ESM application"] --> Repository
+    Repository --> Store["KnowledgeStore"]
+    Store --> SQLite[("Local SQLite database")]
+```
 
-### Core library
+The core entry point works independently of the Harness adapter. Git inspection runs locally and does not fetch missing objects or contact remotes.
 
-After the package is published, install the core library with:
+## Requirements and installation
+
+- Node.js 20+ and npm. The locked development/test tooling requires Node.js 20.19+ or 22.12+ on a supported major version.
+- `better-sqlite3` is a native dependency; installation requires a compatible prebuilt binary or a working native build toolchain.
+- Git is required for source installation and Git provenance/freshness checks.
+
+### npm registry
+
+Check that your registry provides a release before installing:
 
 ```sh
+npm view dsh-knowledge-core version
 npm install dsh-knowledge-core
 ```
 
-Importing `dsh-knowledge-core` does not load DeepSeek Harness packages. The DSH adapter is an optional package subpath.
+If the registry does not provide the package, use the source installation below.
 
-### DeepSeek Harness plugin from a local checkout
-
-With the DSH CLI and a configured profile available, build and install the checkout as a bundle:
+### From source
 
 ```sh
-npm install
+git clone https://github.com/Claven07/dsh-knowledge-core.git
+cd dsh-knowledge-core
+npm ci
 npm run build
-dsh plugin --profile <profile> add .
 ```
 
-The repository declares a `dsh.bundle` patch that registers `dsh-knowledge/plugin`. For a GitHub installation, the current Harness packaging flow is:
+To use the built checkout in another Node.js project, run this from that project, replacing the path:
 
 ```sh
-dsh plugin --profile <profile> add github:Claven07/dsh-knowledge-core
+npm install /absolute/path/to/dsh-knowledge-core
 ```
 
-Git installs build from source through the package `prepare` script. pnpm 10 may require allowing the package build in that profile's `pnpm-workspace.yaml` before the install can complete. Review the package source before allowing install-time builds.
+The package's `prepare` script also runs the build during installation.
 
-The SQLite file defaults to `$DSH_HOME/knowledge/knowledge.sqlite`, using the Harness home resolver (`$DSH_HOME`, then `~/.dsh`). Optional plugin settings are `databasePath`, `dshHome`, and `project`. `databasePath` can be absolute or relative to the process working directory. To select a project for retrieval, add an id-targeted config override to the profile's `cordis.patch.yml`:
+## Quick start
+
+Save this as `quick-start.mjs` in a project where the package is installed, then run `node quick-start.mjs`:
+
+```js
+import {
+  KnowledgeRepository,
+  KnowledgeStore,
+  retrieveRelevantKnowledge,
+} from "dsh-knowledge-core";
+
+const store = new KnowledgeStore(".dsh-knowledge/knowledge.sqlite");
+const repository = new KnowledgeRepository(store);
+const scope = { workspace: process.cwd(), project: "payments" };
+
+repository.create({
+  type: "decision",
+  content: "Store project knowledge in SQLite.",
+  scope,
+  evidence: [{
+    type: "file",
+    source: "README.md",
+    locator: "Configuration and data storage",
+    timestamp: new Date().toISOString(),
+  }],
+});
+
+const matches = retrieveRelevantKnowledge(
+  repository,
+  "project knowledge SQLite",
+  { ...scope, limit: 4 },
+);
+
+console.log(matches.map(({ knowledge }) => knowledge.content));
+store.close();
+```
+
+New records start as `candidate`. After reviewing a record, an application can mark it verified with `repository.update(id, { status: "verified" })`. Use `repository.archive(id)` to archive it, or `repository.supersede(id, replacementId)` to replace a verified record with another verified record in the same scope.
+
+`repository.search(query, filters)` performs literal substring matching. `retrieveRelevantKnowledge()` returns ranked records with scores and explanations, includes workspace-wide knowledge alongside the selected project, and excludes archived/superseded records.
+
+The public core also exports `captureFileProvenance()`, `checkKnowledgeFreshness()`, `checkKnowledgeHealth()`, and `checkKnowledgeHealthBatch()`. Health and freshness checks take an explicit `workspaceDirectory`; storing file evidence alone does not capture Git provenance.
+
+## DeepSeek Harness integration
+
+The adapter uses the Harness `0.2.0-rc.2` APIs declared in the package's optional peer dependencies. A compatible DSH CLI, pnpm, and a configured profile are required.
+
+The package exports the adapter at `dsh-knowledge-core/plugin`. Its `dsh.bundle.patch` points to [cordis.patch.yml](cordis.patch.yml), which retains the plugin ID `dsh-knowledge` and registration name `dsh-knowledge/plugin`. Install under the `dsh-knowledge` dependency alias so that registration resolves.
+
+For a built local checkout, replace the absolute path and profile name:
+
+```sh
+dsh plugin --profile <profile> add "dsh-knowledge@file:/absolute/path/to/dsh-knowledge-core"
+```
+
+Or install from the repository:
+
+```sh
+dsh plugin --profile <profile> add dsh-knowledge@github:Claven07/dsh-knowledge-core
+```
+
+Git installations build through `prepare`. If pnpm blocks required build scripts, review the packages and allow the exact build entries it reports in the profile's `pnpm-workspace.yaml` before retrying. See pnpm's [package aliases](https://pnpm.io/aliases) documentation for the dependency-name behavior.
+
+Add an ID-targeted override to the profile's `cordis.patch.yml` to select a project and enable extraction:
 
 ```yaml
 - id: dsh-knowledge
@@ -63,159 +139,60 @@ The SQLite file defaults to `$DSH_HOME/knowledge/knowledge.sqlite`, using the Ha
     automaticExtraction: true
 ```
 
-The override replaces the row's full config, so include every setting you need to retain. When no project label is configured, automatic retrieval considers workspace-wide items only; the current Session API supplies `cwd` but no project identity. Tool calls default to the configured project and can pass `project: null` to select or create workspace-wide knowledge.
+An override replaces the row's configuration, so include all settings you need to retain.
 
-Automatic extraction is opt-in and defaults to `false`. Enable it with `automaticExtraction: true` in the plugin configuration. Extracted items have `creationOrigin: "automatic"` and remain candidates. They are visible to `knowledge_list` (filter with `creationOrigin: "automatic"`) but are excluded from M2 retrieval until explicitly verified. There is no model-facing verification tool.
+| Tool | Purpose |
+| --- | --- |
+| `knowledge_add` | Create a candidate with caller evidence and current-session evidence when available. |
+| `knowledge_search` | Search stored content literally with scope and lifecycle filters. |
+| `knowledge_list` | List records by scope, type, status, or creation origin. |
+| `knowledge_get` | Read a record; `includeHealth: true` requests a live health check. |
+| `knowledge_archive` | Archive a record in the selected scope. |
+| `knowledge_check_freshness` | Compare Git-backed evidence in the active workspace/configured project. |
+| `knowledge_health` | Check 1–16 IDs; `includeGuidance: true` adds advisory follow-up guidance. |
 
-## Core usage
+Before agent steps, the adapter retrieves at most four relevant records and injects up to 1,800 characters of quoted context. `knowledge_add` attempts Git provenance capture for clean, tracked file evidence when the requested workspace matches the active session.
 
-```ts
-import {
-  KnowledgeRepository,
-  KnowledgeStore,
-  retrieveRelevantKnowledge,
-} from "dsh-knowledge-core";
+## Configuration and data storage
 
-const store = new KnowledgeStore(".dsh-knowledge/knowledge.sqlite");
-const knowledge = new KnowledgeRepository(store);
+All plugin settings are optional:
 
-const item = knowledge.create({
-  type: "decision",
-  content: "Provider selection must use ResponseRouter.",
-  scope: { workspace: "/work/payments", project: "payments" },
-  evidence: [
-    {
-      type: "file",
-      source: "src/router.ts",
-      locator: "ResponseRouter",
-      timestamp: new Date().toISOString(),
-    },
-  ],
-});
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `databasePath` | `<resolved DSH home>/knowledge/knowledge.sqlite` | SQLite file path; relative paths resolve against the process working directory. |
+| `dshHome` | `DSH_HOME`, then `~/.dsh` | Override the Harness home used by the default database path. |
+| `project` | No project label | Select the default project for tools, extraction, and pre-step retrieval. |
+| `automaticExtraction` | `false` | Enable rule-based candidate extraction from direct user messages. |
 
-const matches = knowledge.search("ResponseRouter", {
-  workspace: "/work/payments",
-  project: "payments",
-});
+With no home override, the plugin stores data in `~/.dsh/knowledge/knowledge.sqlite`. The core library requires an explicit database path; the quick start uses `.dsh-knowledge/knowledge.sqlite`. `KnowledgeStore` creates parent directories and supports `:memory:` for temporary databases. File-backed databases use SQLite WAL mode.
 
-const ranked = retrieveRelevantKnowledge(knowledge, "provider fallback routing", {
-  workspace: "/work/payments",
-  project: "payments",
-  limit: 8,
-});
+The adapter uses the active session's `cwd` as its workspace. Without a configured project, tools and pre-step retrieval use workspace-wide knowledge. Tools with a project parameter accept `project: null` to select workspace-wide records explicitly.
 
-store.close();
+When extraction is enabled, bounded direct-user statements are processed after each turn. The detector stores the selected statement as a candidate with a compact session reference, rather than a full transcript. Extracted records have `creationOrigin: "automatic"`; inspect them with `knowledge_list`. They enter ranked retrieval only after explicit verification through the core API.
+
+## Development
+
+From a source checkout:
+
+```sh
+npm ci
+npm run build
+npm run typecheck
+npm test
 ```
 
-`repository.search()` remains a deterministic literal `LIKE` search. The separate `retrieveRelevantKnowledge()` API performs explainable relevance ranking and returns each `Knowledge` with a score breakdown.
+The build emits JavaScript and TypeScript declarations in `dist/`. Tests run with Vitest in a Node.js environment.
 
-`create()` assigns a UUID and timestamps and starts an item as `candidate`. Candidates can be verified or archived. Verified items can be archived or superseded by another verified item in the same scope; superseded items can be archived.
+## Limitations and security
 
-## Git provenance and freshness (M3)
+- Retrieval uses local lexical matching and scans active records in scope. It does not use embeddings or semantic search.
+- Extraction recognizes a narrow set of explicit statements and may miss useful knowledge. Assistant assertions and tool outcomes are not treated as evidence for automatic candidates; there is no model-facing verification tool.
+- Health and freshness are on-demand evidence checks, not proof that a claim is true. `current` means checkable Git-backed snapshots match; `potentially_stale` signals a changed or missing source; `unverifiable` means evidence could not be checked. These checks do not alter lifecycle status or retrieval eligibility.
+- Git checks are bounded snapshot comparisons. They do not follow renames or identify every historical edit. Missing objects, unsafe paths, configured filters, and hidden index state can make evidence unverifiable.
+- Workspace scope uses the supplied string without filesystem canonicalization. Use consistent workspace paths and configure project labels explicitly. Data stays in the selected SQLite database; synchronization is not provided.
+- The Harness ingestion tool and automatic extraction reject common secret patterns, but this filtering is not comprehensive. The trusted core repository API does not scan secrets. Do not store credentials or sensitive personal data.
+- Injected knowledge is quoted and labeled as untrusted data. Review stored content before relying on it or marking it verified.
 
-File evidence may include structured `gitProvenance` containing a full Git commit object ID and a repository-relative path. SQLite schema v2 stores these fields separately from evidence text; existing schema v1 evidence migrates with no Git provenance and remains valid.
+## License
 
-The Harness `knowledge_add` tool attempts capture for explicit file evidence only when its workspace matches the active session `cwd`. Capture succeeds only for a tracked file present in `HEAD` with no relevant staged or working-tree changes. A failed or unsafe inspection does not prevent knowledge creation; the tool returns a concise capture outcome. Paths are normalized to Git `/` separators and must remain repository-relative.
-
-`checkKnowledgeFreshness(knowledge, { workspaceDirectory })` and the `knowledge_check_freshness` tool produce per-evidence results with one of these statuses:
-
-- **current** — the current file snapshot matches the recorded commit snapshot.
-- **potentially_stale** — the file was modified, deleted, renamed away, or differs in the current working tree/index.
-- **unverifiable** — provenance is absent, Git or required objects are unavailable, the operation times out, or safe comparison cannot be guaranteed.
-
-The aggregate status describes Git-backed file evidence. Session evidence does not count as proof of file freshness, and legacy file evidence without Git provenance is reported as unverifiable. A restored file snapshot can be current even if Git history contains an intermediate edit. Freshness never changes candidate, verified, superseded, or archived status and does not prove a claim true or false. Checks are bounded, do not return diffs/source contents, do not follow renames, and never fetch missing objects.
-
-## Knowledge health (M5)
-
-`checkKnowledgeHealth()` and `checkKnowledgeHealthBatch()` summarize the same M3 Git comparison results. `knowledge_health` checks 1–16 IDs in the active workspace/project; `knowledge_get(..., includeHealth: true)` opts into a live check for one item. Health checks are explicit foreground operations against live repository state. Health is not persisted or cached, and never verifies, archives, supersedes, deletes, or edits knowledge. `current` means checkable Git-backed file snapshots match; it does not mean the claim is verified or true. `unverifiable` means the evidence could not be checked and does not mean the knowledge is false. Session-only automatic candidates therefore report `unverifiable` without Git-backed file evidence. Health returns at most 16 per-evidence details per item; additional evidence is counted in `overflowCount` and makes the result `unverifiable` unless stale evidence takes precedence. The existing `checkKnowledgeFreshness()` API and `knowledge_check_freshness` tool remain available for compatibility.
-
-`knowledge_health({ ids, includeGuidance: true })` opts into deterministic advisory guidance based only on the current health reasons, with no additional health or Git work. Guidance is absent by default, empty for current health, and null when health is null. An empty guidance array does not mean verified or true; `unverifiable` does not mean false. Guidance never changes knowledge or retrieval, and normal search and pre-step retrieval remain health-free.
-
-## DSH architecture
-
-```text
-DeepSeek Harness hooks and tools
-            │
-            ├── session/event ── injection-ID deduplication
-            ├── session/event + turn boundaries ── bounded candidate extraction (opt-in)
-            ├── agent/pre-step ─ retrieval and compact context
-            └── ctx.tools.register() ─ model-facing knowledge tools, freshness, and health checks
-                                  │
-                       DSH adapter package
-                                  │
-                       KnowledgeRepository
-                                  │
-                          KnowledgeStore
-                                  │
-                              SQLite
-```
-
-`src/knowledge` has no Harness imports. `src/harness` is the adapter layer and is exposed through `dsh-knowledge/plugin`. DSH tools use the current `defineTool`/`ctx.tools.register()` API. Their structured JSON results are concise; content is truncated in result summaries, and `knowledge_get` returns a bounded evidence list.
-
-The adapter gets a workspace from the active session's `header.cwd`. The project name is configured explicitly because the current Session header does not provide one. Tool calls can pass workspace/project filters. A configured project is the default exact scope; without a configured project, tools default to workspace-wide knowledge only. `knowledge_add`, `knowledge_search`, `knowledge_list`, `knowledge_get`, and `knowledge_archive` accept `project: null` to select workspace-wide scope explicitly. `knowledge_get` performs no health check by default; `includeHealth: true` requests an observational single-item inspection, while `knowledge_search` and `agent/pre-step` retrieval never check health. Health does not affect retrieval ranking, eligibility, or lifecycle. Tool-created knowledge uses `exec.agent.session.id` for session evidence and timestamps evidence at creation time.
-
-Before an agent request, `agent/pre-step` passes the latest user-authored text in the proposed step to the core retrieval engine. It retrieves at most four items and injects no more than 1,800 characters in a `<dsh-knowledge>` block. Stored text is quoted and labeled untrusted; directives in it should not be followed. Retrieval considers verified knowledge and explicit-origin candidates; automatic-origin candidates are excluded until explicitly verified. If a project is configured, exact-project entries rank above workspace-wide entries when textual relevance is equal; verified entries rank above candidates at equal scope. If no project is configured, retrieval is workspace-wide only. A session event observer remembers committed injected IDs in memory, scans a session transcript once to cover sessions present at plugin load, and releases state on session disposal; events are not stored in SQLite.
-
-## Automatic candidate extraction (M4)
-
-When enabled, the Harness adapter collects only bounded references to direct human-authored `user/message` events (`source.kind === "user"`) during a turn. After `turn/end`, a process-wide single-worker queue runs a conservative deterministic rule set outside the event callback. It recognizes a small set of explicit project decisions, project facts, corrections, durable constraints, and causal failure/fix statements. It does not infer knowledge from assistant assertions, model tool arguments, or tool success alone.
-
-Every extracted item is stored as a candidate with automatic origin and session evidence containing the session ID, event sequence locator, and event timestamp. Conversation text is transient input: no raw transcript or excerpts are added to evidence. The event count, text length, candidate count, queue size, and shutdown wait are bounded; overflow and failures drop work without interrupting the agent task.
-
-Before persistence, a deterministic filter rejects common API key, bearer/JWT, credential assignment, connection-string, and private-key patterns. Rejected content is not logged or redacted into a candidate. Same-scope, same-type duplicates are suppressed using the conservative M2 duplicate predicate; existing knowledge is never merged or changed. Candidates that appear to disagree with verified knowledge are not automatically promoted or superseded.
-
-This is intentionally a narrow rules-first detector. It may miss valid knowledge and does not provide general language understanding, LLM extraction, confidence scores, or a verification workflow. Review candidates with `knowledge_list`; M2 will use one only after an explicit caller changes its status to verified.
-
-## Deterministic retrieval (M2)
-
-M2 uses local text and existing metadata; it does not use embeddings, an LLM, or external services. Query and content text are Unicode-normalized, lowercased, and split on punctuation. Common stopwords are ignored, and only the first 16 meaningful query tokens are scored. A normalized exact phrase match is detected in addition to exact token and conservative partial-token matches. Text with no meaningful token match is not returned.
-
-The ranking score is an integer built from fixed, centralized weights:
-
-| Dimension | Contribution |
-| --- | ---: |
-| Exact normalized phrase | 1,000 text points |
-| Exact token match | 100 text points per token |
-| Partial token match | 40 text points per token |
-| Token coverage | Up to 400 text points |
-| Exact configured project scope | 1,000 ranking points |
-| Verified status | 100 ranking points |
-| Explicit preferred type | 10 points per preference rank |
-| Evidence availability | 0–3 points |
-| Relative freshness | 1–4 points |
-
-Text points are multiplied by 10,000, so scope, verification, and metadata cannot outweigh a textual relevance point. Project scope is the next ranking dimension, then verification. Type only affects ordering when a caller explicitly supplies `preferredTypes`; no type is treated as inherently more relevant. Freshness is measured against the newest matching item in the same retrieval, so identical query/database state produces the same ranking without a wall-clock dependency. Stable timestamp and ID ordering break remaining ties.
-
-Near-duplicate suppression is deliberately conservative: records must have the same knowledge type and exact workspace/project scope, and must either normalize to the same token sequence or preserve one another's token order while sharing at least 90% of their distinct content tokens (with at least eight tokens). Reordered claims and changes to negation or modal/contrast words are retained. The higher-ranked entry is kept and lists suppressed IDs in its developer-facing explanation.
-
-Candidate collection scans active records in the explicitly selected workspace/project scopes using the existing SQLite indexes and repository API. This keeps M0 storage/search semantics unchanged and avoids a schema migration; retrieval work grows with the number of active records in those scopes.
-
-## Current limitations
-
-- DSH integration is limited to its plugin tools, the current session identity for explicit tool-created evidence, and conservative pre-step retrieval. It does not capture every session event.
-- Project identity must be configured; `cwd` is used as the workspace value without filesystem canonicalization.
-- Only explicit file evidence in the active session workspace is considered for opportunistic provenance capture. Other references remain caller-supplied.
-- Freshness is a bounded, on-demand snapshot comparison, not continuous monitoring. It compares committed snapshots and the current worktree; it does not detect every historical edit that was later reverted.
-- Git may not safely compare files with configured clean/process filters, symlinked path components, or index flags such as `assume-unchanged` and `skip-worktree`; those checks return `unverifiable`. Provenance capture also requires an ordinary tracked worktree file and an index entry with no hidden-state flags.
-- No Git network operations are performed. Missing objects are reported as unverifiable rather than fetched.
-- The model-facing Harness `knowledge_add` tool filters common secret patterns in content and evidence source/locator fields. The lower-level trusted repository API does not scan secrets; the Harness filter is not comprehensive and cannot guarantee detection of every sensitive or personal value. Do not store credentials or other sensitive values.
-- `repository.search()` remains literal SQLite `LIKE` matching. M2 ranked retrieval is deterministic lexical matching, not semantic search; candidate collection scans the active records in scope.
-- Knowledge is local to one SQLite database and is not synchronized.
-- Continuous stale-knowledge monitoring and a dedicated candidate review/verification workflow are not implemented.
-- M6.3 outcome evidence is dormant. Harness `0.2.0-rc.2` does not provide a verified authoritative binding between an execution token, its originating turn/step, and a durable result. Active outcome-event observation is disabled, and outcome-evidence attachment is disconnected from automatic candidate admission; M4/M6.1 extraction remains active when opted in.
-- Adapter tests use the published DSH tool definitions and typed fixtures; they do not boot a complete DSH profile or model adapter.
-
-## Roadmap
-
-- **M0 Core storage** — completed
-- **M1 DSH tools** — completed
-- **M2 Intelligent deterministic retrieval** — completed; ranked local text retrieval is used by bounded pre-step context injection
-- **M3 Git-aware provenance and on-demand freshness** — completed
-- **M4 Automatic knowledge and lesson candidate extraction** — implemented; opt-in and candidate-only
-- **M5 Knowledge health and staleness visibility** — explicit, bounded, live Git checks; no background monitoring or lifecycle changes
-- **M6 Candidate review workflow and richer Git-aware knowledge** — partial; dedicated candidate review workflow remains future
-- **M6.1 Lesson/action-reference contract** — implemented and tested in this repository; deterministic lesson candidates with transient reference-intent assertions and grammar-selected action references; candidate-only
-- **M6.2 Harness reference-intent assertions** — contribution branch pushed; upstream PR acceptance and merge remain unconfirmed
-- **M6.3 Supported tool outcome evidence** — dormant/blocked pending a verified authoritative upstream execution-binding contract; no active outcome-event observation or outcome-evidence attachment to automatic candidates
-
-Future work includes continuous stale-knowledge monitoring and a dedicated candidate review workflow. These are not current capabilities.
+[MIT](LICENSE) — Copyright (c) 2026 Claven07.
