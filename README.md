@@ -202,6 +202,7 @@ Candidate collection scans active records in the explicitly selected workspace/p
 - `repository.search()` remains literal SQLite `LIKE` matching. M2 ranked retrieval is deterministic lexical matching, not semantic search; candidate collection scans the active records in scope.
 - Knowledge is local to one SQLite database and is not synchronized.
 - Continuous stale-knowledge monitoring and a dedicated candidate review/verification workflow are not implemented.
+- M6.3 outcome evidence is dormant. Harness `0.2.0-rc.2` does not provide a verified authoritative binding between an execution token, its originating turn/step, and a durable result. Active outcome-event observation is disabled, and outcome-evidence attachment is disconnected from automatic candidate admission; M4/M6.1 extraction remains active when opted in.
 - Adapter tests use the published DSH tool definitions and typed fixtures; they do not boot a complete DSH profile or model adapter.
 
 ## Roadmap
@@ -212,6 +213,9 @@ Candidate collection scans active records in the explicitly selected workspace/p
 - **M3 Git-aware provenance and on-demand freshness** — completed
 - **M4 Automatic knowledge and lesson candidate extraction** — implemented; opt-in and candidate-only
 - **M5 Knowledge health and staleness visibility** — explicit, bounded, live Git checks; no background monitoring or lifecycle changes
-- **M6 Candidate review workflow and richer Git-aware knowledge** — future
+- **M6 Candidate review workflow and richer Git-aware knowledge** — partial; dedicated candidate review workflow remains future
+- **M6.1 Lesson/action-reference contract** — implemented and tested in this repository; deterministic lesson candidates with transient reference-intent assertions and grammar-selected action references; candidate-only
+- **M6.2 Harness reference-intent assertions** — contribution branch pushed; upstream PR acceptance and merge remain unconfirmed
+- **M6.3 Supported tool outcome evidence** — dormant/blocked pending a verified authoritative upstream execution-binding contract; no active outcome-event observation or outcome-evidence attachment to automatic candidates
 
 Future work includes continuous stale-knowledge monitoring and a dedicated candidate review workflow. These are not current capabilities.
