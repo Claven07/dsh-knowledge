@@ -6,3 +6,6 @@ coverage/
 *.sqlite-*
 .env
 .env.*
+
+# Generated npm package archives
+*.tgz

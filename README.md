@@ -1,8 +1,8 @@
-# dsh-knowledge
+# DSH Knowledge Core
 
-`dsh-knowledge` is a local, evidence-backed project knowledge layer for coding agents. It stores durable project facts, engineering decisions, and lessons in SQLite, with explicit workspace/project scope and lifecycle status.
+`DSH Knowledge Core` is a local, evidence-backed project knowledge layer for coding agents. It stores durable project facts, engineering decisions, and lessons in SQLite, with explicit workspace/project scope and lifecycle status.
 
-Ordinary chat memory often retains conversational details without showing what a statement describes or where it came from. `dsh-knowledge` keeps evidence as first-class records. Explicit entries use caller-supplied evidence; opt-in M4 extraction attaches bounded session evidence to automatic candidates.
+Ordinary chat memory often retains conversational details without showing what a statement describes or where it came from. `DSH Knowledge Core` keeps evidence as first-class records. Explicit entries use caller-supplied evidence; opt-in M4 extraction attaches bounded session evidence to automatic candidates.
 
 ## Status
 
@@ -30,10 +30,10 @@ There is no automatic LLM extraction, embeddings, vector search, external API, H
 After the package is published, install the core library with:
 
 ```sh
-npm install dsh-knowledge
+npm install dsh-knowledge-core
 ```
 
-Importing `dsh-knowledge` does not load DeepSeek Harness packages. The DSH adapter is an optional package subpath.
+Importing `dsh-knowledge-core` does not load DeepSeek Harness packages. The DSH adapter is an optional package subpath.
 
 ### DeepSeek Harness plugin from a local checkout
 
@@ -48,7 +48,7 @@ dsh plugin --profile <profile> add .
 The repository declares a `dsh.bundle` patch that registers `dsh-knowledge/plugin`. For a GitHub installation, the current Harness packaging flow is:
 
 ```sh
-dsh plugin --profile <profile> add github:Claven07/dsh-knowledge
+dsh plugin --profile <profile> add github:Claven07/dsh-knowledge-core
 ```
 
 Git installs build from source through the package `prepare` script. pnpm 10 may require allowing the package build in that profile's `pnpm-workspace.yaml` before the install can complete. Review the package source before allowing install-time builds.
@@ -74,7 +74,7 @@ import {
   KnowledgeRepository,
   KnowledgeStore,
   retrieveRelevantKnowledge,
-} from "dsh-knowledge";
+} from "dsh-knowledge-core";
 
 const store = new KnowledgeStore(".dsh-knowledge/knowledge.sqlite");
 const knowledge = new KnowledgeRepository(store);
