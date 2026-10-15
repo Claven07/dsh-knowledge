@@ -1,12 +1,14 @@
 # DSH Knowledge Core
 
-A local, evidence-backed project knowledge layer for coding agents.
-
-## Overview
+Persistent, evidence-backed project memory for AI coding agents.
 
 Coding agents need project context that survives a conversation: architectural decisions, repository facts, and lessons worth keeping. DSH Knowledge Core stores that context in SQLite, with workspace/project scope, lifecycle status, and references to the evidence behind each entry.
 
 Records can reference files, Git snapshots, or sessions. Deterministic retrieval selects relevant knowledge, while on-demand Git checks help identify evidence that has changed. Use the core as an ESM library or connect it to DeepSeek Harness through the optional adapter.
+
+Your application decides what to store and how to use retrieved records. The core does not run an agent, call an LLM, provide semantic/vector search, or synchronize knowledge between machines. Automatic extraction and context injection are optional Harness adapter features.
+
+[Install](#requirements-and-installation) · [Quick start](#quick-start) · [Harness integration](#deepseek-harness-integration) · [Configuration](#configuration-and-data-storage) · [Limitations and security](#limitations-and-security)
 
 ## Key features
 
@@ -19,52 +21,22 @@ Records can reference files, Git snapshots, or sessions. Deterministic retrieval
 - **Optional candidate extraction:** Conservative rules extract candidates from direct user messages in Harness.
 - **Harness tools and context:** Seven knowledge tools and bounded retrieval before agent steps.
 
-## Architecture
-
-```mermaid
-flowchart TD
-    Harness["DeepSeek Harness tools and hooks"] --> Adapter["DSH adapter"]
-    Adapter --> Repository["KnowledgeRepository"]
-    Application["ESM application"] --> Repository
-    Repository --> Store["KnowledgeStore"]
-    Store --> SQLite[("Local SQLite database")]
-```
-
-The core entry point works independently of the Harness adapter. Git inspection runs locally and does not fetch missing objects or contact remotes.
-
 ## Requirements and installation
 
-- Node.js 20+ and npm. The locked development/test tooling requires Node.js 20.19+ or 22.12+ on a supported major version.
+- Node.js 20+ and npm, on a Node major supported by `better-sqlite3`. The locked development/test tooling requires Node.js 20.19+ or 22.12+ on a supported major version.
+- ESM imports: use a `.mjs` file or a project with `"type": "module"`. JavaScript and TypeScript declarations are included; there is no CommonJS `require` export.
 - `better-sqlite3` is a native dependency; installation requires a compatible prebuilt binary or a working native build toolchain.
-- Git is required for source installation and Git provenance/freshness checks.
+- Git is required for source installation and Git provenance/freshness checks, but not for basic storage and retrieval.
 
-### npm registry
-
-Check that your registry provides a release before installing:
+Install the library in your Node.js project:
 
 ```sh
-npm view dsh-knowledge-core version
 npm install dsh-knowledge-core
 ```
 
-If the registry does not provide the package, use the source installation below.
+If a prebuilt native binary is unavailable, compilation requires Python and platform C/C++ build tools: Visual Studio's C++ workload on Windows, Xcode Command Line Tools on macOS, or `make` and a compiler on Unix. See the [node-gyp prerequisites](https://github.com/nodejs/node-gyp#installation). A separate SQLite server is not required.
 
-### From source
-
-```sh
-git clone https://github.com/Claven07/dsh-knowledge-core.git
-cd dsh-knowledge-core
-npm ci
-npm run build
-```
-
-To use the built checkout in another Node.js project, run this from that project, replacing the path:
-
-```sh
-npm install /absolute/path/to/dsh-knowledge-core
-```
-
-The package's `prepare` script also runs the build during installation.
+Use `npm view dsh-knowledge-core version engines` to inspect the release supplied by your registry. For a source checkout, see [Development](#development). A Harness runtime is not needed to use the core entry point.
 
 ## Quick start
 
@@ -87,8 +59,8 @@ repository.create({
   scope,
   evidence: [{
     type: "file",
-    source: "README.md",
-    locator: "Configuration and data storage",
+    source: "quick-start.mjs",
+    locator: "repository.create",
     timestamp: new Date().toISOString(),
   }],
 });
@@ -103,19 +75,47 @@ console.log(matches.map(({ knowledge }) => knowledge.content));
 store.close();
 ```
 
-New records start as `candidate`. After reviewing a record, an application can mark it verified with `repository.update(id, { status: "verified" })`. Use `repository.archive(id)` to archive it, or `repository.supersede(id, replacementId)` to replace a verified record with another verified record in the same scope.
+On a fresh database, this prints `[ 'Store project knowledge in SQLite.' ]`. The record persists in `.dsh-knowledge/knowledge.sqlite` after the store closes; each run creates another candidate. File evidence here points to the example you saved. It is caller-supplied metadata, not a file-content check or captured Git snapshot.
+
+New records start as `candidate`. Explicit candidates, including this example, are eligible for ranked retrieval immediately; automatically extracted candidates require verification first. After reviewing a record, an application can mark it verified with `repository.update(id, { status: "verified" })`. Use `repository.archive(id)` to archive it, or `repository.supersede(id, replacementId)` to replace a verified record with another verified record in the same scope.
 
 `repository.search(query, filters)` performs literal substring matching. `retrieveRelevantKnowledge()` returns ranked records with scores and explanations, includes workspace-wide knowledge alongside the selected project, and excludes archived/superseded records.
 
+Pass scope filters to `repository.list()` and `repository.search()` explicitly: without filters they can return records across all workspaces, projects, and lifecycle states. For those methods, `project: null` selects workspace-wide records; omitting `project` does not filter projects. Ranked retrieval always requires a workspace and, without a project, selects only workspace-wide records.
+
 The public core also exports `captureFileProvenance()`, `checkKnowledgeFreshness()`, `checkKnowledgeHealth()`, and `checkKnowledgeHealthBatch()`. Health and freshness checks take an explicit `workspaceDirectory`; storing file evidence alone does not capture Git provenance.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Harness["DeepSeek Harness tools and hooks"] --> Adapter["DSH adapter"]
+    Adapter --> Repository["KnowledgeRepository"]
+    Application["ESM application"] --> Repository
+    Repository --> Store["KnowledgeStore"]
+    Store --> SQLite[("Local SQLite database")]
+```
+
+| Public entry point | Purpose |
+| --- | --- |
+| `dsh-knowledge-core` | Storage, repository, ranked retrieval, extraction helpers, Git inspection, health checks, and their TypeScript types. |
+| `dsh-knowledge-core/plugin` | Cordis plugin with named `name`, `inject`, `Config`, and `apply` exports, plus a default plugin object. |
+
+The core entry point works independently of the Harness adapter. Git inspection runs locally and does not fetch missing objects or contact remotes.
 
 ## DeepSeek Harness integration
 
-The adapter uses the Harness `0.2.0-rc.2` APIs declared in the package's optional peer dependencies. A compatible DSH CLI, pnpm, and a configured profile are required.
+The adapter targets Harness `0.2.0-rc.2`. Its optional peer requirements are `@deepseek-ai/dsh-agent`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-session`, and `@deepseek-ai/dsh-tools` at exactly `0.2.0-rc.2`, plus `@deepseek-ai/cordis` `~4.0.4` and `@deepseek-ai/schemastery` `~3.18.4`. Use a matching DSH CLI/runtime, pnpm, and a configured profile. Compatibility with other Harness releases is not established.
 
 The package exports the adapter at `dsh-knowledge-core/plugin`. Its `dsh.bundle.patch` points to [cordis.patch.yml](cordis.patch.yml), which retains the plugin ID `dsh-knowledge` and registration name `dsh-knowledge/plugin`. Install under the `dsh-knowledge` dependency alias so that registration resolves.
 
-For a built local checkout, replace the absolute path and profile name:
+For an npm installation, replace `<profile>` with your profile name, such as `web`:
+
+```sh
+dsh plugin --profile <profile> add dsh-knowledge@npm:dsh-knowledge-core
+```
+
+For a built [local checkout](#development), replace the absolute path and profile name:
 
 ```sh
 dsh plugin --profile <profile> add "dsh-knowledge@file:/absolute/path/to/dsh-knowledge-core"
@@ -129,7 +129,7 @@ dsh plugin --profile <profile> add dsh-knowledge@github:Claven07/dsh-knowledge-c
 
 Git installations build through `prepare`. If pnpm blocks required build scripts, review the packages and allow the exact build entries it reports in the profile's `pnpm-workspace.yaml` before retrying. See pnpm's [package aliases](https://pnpm.io/aliases) documentation for the dependency-name behavior.
 
-Add an ID-targeted override to the profile's `cordis.patch.yml` to select a project and enable extraction:
+Add an ID-targeted override to `<resolved DSH home>/profiles/<profile>/cordis.patch.yml` (by default `~/.dsh/profiles/<profile>/cordis.patch.yml`) to select a project and opt into extraction:
 
 ```yaml
 - id: dsh-knowledge
@@ -172,16 +172,24 @@ When extraction is enabled, bounded direct-user statements are processed after e
 
 ## Development
 
-From a source checkout:
+Clone the repository and install its development dependencies:
 
 ```sh
+git clone https://github.com/Claven07/dsh-knowledge-core.git
+cd dsh-knowledge-core
 npm ci
 npm run build
 npm run typecheck
 npm test
 ```
 
-The build emits JavaScript and TypeScript declarations in `dist/`. Tests run with Vitest in a Node.js environment.
+`npm ci` runs the package's `prepare` script, which builds with TypeScript; `npm run build` rebuilds explicitly. The build emits ESM JavaScript and TypeScript declarations in `dist/`. `npm run typecheck` checks `src/` without emitting files; `npm test` runs `tests/**/*.test.ts` with Vitest in a Node.js environment.
+
+To use the built checkout in another Node.js project, run this from that project, replacing the path:
+
+```sh
+npm install "/absolute/path/to/dsh-knowledge-core"
+```
 
 ## Limitations and security
 
@@ -190,8 +198,10 @@ The build emits JavaScript and TypeScript declarations in `dist/`. Tests run wit
 - Health and freshness are on-demand evidence checks, not proof that a claim is true. `current` means checkable Git-backed snapshots match; `potentially_stale` signals a changed or missing source; `unverifiable` means evidence could not be checked. These checks do not alter lifecycle status or retrieval eligibility.
 - Git checks are bounded snapshot comparisons. They do not follow renames or identify every historical edit. Missing objects, unsafe paths, configured filters, and hidden index state can make evidence unverifiable.
 - Workspace scope uses the supplied string without filesystem canonicalization. Use consistent workspace paths and configure project labels explicitly. Data stays in the selected SQLite database; synchronization is not provided.
+- Workspace/project scope is a filtering convention, not an access-control boundary. The trusted repository API can read across scopes. Protect access to the SQLite database and its WAL/SHM files and backups; exclude private project-memory files from version control.
 - The Harness ingestion tool and automatic extraction reject common secret patterns, but this filtering is not comprehensive. The trusted core repository API does not scan secrets. Do not store credentials or sensitive personal data.
 - Injected knowledge is quoted and labeled as untrusted data. Review stored content before relying on it or marking it verified.
+- Harness places retrieved content in the agent's model context. Local SQLite storage does not prevent that content from being sent to the configured model provider.
 
 ## License
 
