@@ -722,6 +722,12 @@ const nativeGitRunner: GitCommandRunner = {
       return Promise.resolve({ exitCode: null, stdout: "", failure: "cancelled" });
     }
     return new Promise((resolve) => {
+      let closed = false;
+      let result: GitCommandResult | undefined;
+      const finish = (value: GitCommandResult) => {
+        result = value;
+        if (closed) resolve(value);
+      };
       const env: NodeJS.ProcessEnv = { ...process.env };
       for (const key of Object.keys(env)) {
         // Git environment variables can redirect repository discovery, inject
@@ -732,7 +738,7 @@ const nativeGitRunner: GitCommandRunner = {
       }
       env.GIT_OPTIONAL_LOCKS = "0";
 
-      execFile(
+      const child = execFile(
         "git",
         [...args],
         {
@@ -742,33 +748,39 @@ const nativeGitRunner: GitCommandRunner = {
           maxBuffer: MAX_GIT_OUTPUT_BYTES,
           shell: false,
           timeout: timeoutMs,
+          killSignal: "SIGKILL",
           windowsHide: true,
           ...(signal === undefined ? {} : { signal }),
         },
         (error, stdout) => {
           if (error === null) {
-            resolve({ exitCode: 0, stdout });
+            finish({ exitCode: 0, stdout });
             return;
           }
           const code = (error as NodeJS.ErrnoException).code;
           if (code === "ABORT_ERR" || error.name === "AbortError") {
-            resolve({ exitCode: null, stdout, failure: "cancelled" });
+            finish({ exitCode: null, stdout, failure: "cancelled" });
           } else if (code === "ENOENT") {
-            resolve({ exitCode: null, stdout, failure: "git_unavailable" });
+            finish({ exitCode: null, stdout, failure: "git_unavailable" });
           } else if (
             code === "ETIMEDOUT" || error.killed || error.signal === "SIGTERM" ||
             error.signal === "SIGKILL"
           ) {
-            resolve({ exitCode: null, stdout, failure: "timeout" });
+            finish({ exitCode: null, stdout, failure: "timeout" });
           } else if (code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
-            resolve({ exitCode: null, stdout, failure: "output_limit" });
+            finish({ exitCode: null, stdout, failure: "output_limit" });
           } else if (typeof code === "number") {
-            resolve({ exitCode: code, stdout });
+            finish({ exitCode: code, stdout });
           } else {
-            resolve({ exitCode: null, stdout, failure: "spawn_error" });
+            finish({ exitCode: null, stdout, failure: "spawn_error" });
           }
         },
       );
+      // Abort can invoke the callback while the child still holds its cwd.
+      child.once("close", () => {
+        closed = true;
+        if (result !== undefined) resolve(result);
+      });
     });
   },
 };

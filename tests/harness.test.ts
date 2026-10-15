@@ -16,7 +16,7 @@ import {
   type ToolRunContext,
 } from "@deepseek-ai/dsh-tools";
 import { SessionStore, type Session, type SessionEvent } from "@deepseek-ai/dsh-session";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, vi } from "vitest";
 import { KnowledgeRepository } from "../src/knowledge/repository.js";
 import { retrieveRelevantKnowledge } from "../src/knowledge/retrieval.js";
 import { MAX_HEALTH_BATCH_ITEMS } from "../src/knowledge/health.js";
@@ -36,7 +36,7 @@ import {
 } from "../src/harness/retrieval.js";
 import plugin, { apply, type Config } from "../src/harness/plugin.js";
 import type { KnowledgePreStepHandler } from "../src/harness/retrieval.js";
-import { createTemporaryGitRepository, initializeGitRepository, runGit } from "./git-fixtures.js";
+import { gitTest as it, type GitTestScope } from "./git-fixtures.js";
 
 type Listener = (...args: never[]) => unknown;
 
@@ -1303,30 +1303,30 @@ describe("DeepSeek Harness plugin adapters", () => {
     expect(stored?.scope).toEqual({ workspace: "C:\\workspace" });
   });
 
-  it("knowledge_add captures clean file provenance and freshness checks are concise and read-only", async () => {
-    const repo = createTemporaryGitRepository("dsh-knowledge-harness-git-");
+  it("knowledge_add captures clean file provenance and freshness checks are concise and read-only", async ({ gitScope: scope }) => {
+    const repo = scope.repository("dsh-knowledge-harness-git-");
     try {
-      await initializeGitRepository(repo.directory);
+      await scope.initialize(repo.directory);
       repo.write("src/policy.ts", "export const policy = 'allow';\n");
       const commit = await repo.commit("policy");
       const harness = createPluginHarness({ project: "payments" });
       const session = makeSession(repo.directory);
 
-      const created = await harness.invoke("knowledge_add", {
+      const created = await scope.track(() => harness.invoke("knowledge_add", {
         type: "decision",
         content: "Use the policy module for authorization.",
         workspace: repo.directory,
         project: "payments",
         evidence: [{ type: "file", source: "src/policy.ts" }],
-      }, session) as ToolItemResult;
+      }, session)) as ToolItemResult;
       expect(created.provenanceCapture).toMatchObject({ attempted: 1, captured: 1, skipped: 0 });
 
       const stored = openRepository(harness.path).getById(created.item!.id)!;
       expect(stored.evidence[0]?.gitProvenance).toEqual({ commit, path: "src/policy.ts" });
 
-      const checked = await harness.invoke("knowledge_check_freshness", {
+      const checked = await scope.track(() => harness.invoke("knowledge_check_freshness", {
         id: stored.id,
-      }, session) as {
+      }, session)) as {
         ok: boolean;
         knowledgeStatus?: string;
         report: { status: string; evidence: Array<{ status: string; reason?: string }> } | null;
@@ -1339,12 +1339,12 @@ describe("DeepSeek Harness plugin adapters", () => {
       expect(JSON.stringify(checked)).not.toContain("policy =");
 
       repo.write("src/policy.ts", "export const policy = 'deny';\n");
-      const stale = await harness.invoke("knowledge_check_freshness", { id: stored.id }, session) as typeof checked;
+      const stale = await scope.track(() => harness.invoke("knowledge_check_freshness", { id: stored.id }, session)) as typeof checked;
       expect(stale.report?.status).toBe("potentially_stale");
       expect(stale.knowledgeStatus).toBe("candidate");
       expect(openRepository(harness.path).getById(stored.id)?.status).toBe("candidate");
     } finally {
-      repo.cleanup();
+      await scope.cleanup();
     }
   }, 20_000);
 
@@ -1426,10 +1426,10 @@ describe("DeepSeek Harness plugin adapters", () => {
     expect(JSON.stringify(result)).not.toContain("Automatic session candidates have no Git-backed evidence.");
   });
 
-  it("returns health without exposing file paths, Git commits, diffs, or knowledge content", async () => {
-    const repo = createTemporaryGitRepository("dsh-knowledge-harness-health-output-");
+  it("returns health without exposing file paths, Git commits, diffs, or knowledge content", async ({ gitScope: scope }) => {
+    const repo = scope.repository("dsh-knowledge-harness-health-output-");
     try {
-      await initializeGitRepository(repo.directory);
+      await scope.initialize(repo.directory);
       repo.write("src/private-policy.ts", "private file contents\n");
       const commit = await repo.commit("policy");
       const harness = createPluginHarness({ project: "payments" });
@@ -1446,11 +1446,11 @@ describe("DeepSeek Harness plugin adapters", () => {
         }],
       });
 
-      const result = await harness.invoke(
+      const result = await scope.track(() => harness.invoke(
         "knowledge_health",
         { ids: [item.id] },
         makeSession(repo.directory),
-      );
+      ));
 
       expect(result).toMatchObject({
         ok: true,
@@ -1461,7 +1461,7 @@ describe("DeepSeek Harness plugin adapters", () => {
       expect(JSON.stringify(result)).not.toContain("private file contents");
       expect(JSON.stringify(result)).not.toContain(item.content);
     } finally {
-      repo.cleanup();
+      await scope.cleanup();
     }
   }, 20_000);
 
@@ -1505,10 +1505,10 @@ describe("DeepSeek Harness plugin adapters", () => {
     });
   });
 
-  it("cancels an active health request before closing plugin storage", async () => {
-    const repo = createTemporaryGitRepository("dsh-knowledge-harness-health-dispose-");
+  it("cancels an active health request before closing plugin storage", async ({ gitScope: scope }) => {
+    const repo = scope.repository("dsh-knowledge-harness-health-dispose-");
     try {
-      await initializeGitRepository(repo.directory);
+      await scope.initialize(repo.directory);
       repo.write("src/policy.ts", "policy\n");
       const commit = await repo.commit("policy");
       const harness = createPluginHarness({ project: "payments" });
@@ -1524,11 +1524,11 @@ describe("DeepSeek Harness plugin adapters", () => {
           gitProvenance: { commit, path: "src/policy.ts" },
         }],
       });
-      const activeRequest = harness.invoke(
+      const activeRequest = scope.track(() => harness.invoke(
         "knowledge_health",
         { ids: [item.id] },
         makeSession(repo.directory),
-      ) as Promise<{ results: Array<{ health: { status: string; reasons: string[] } | null }> }>;
+      )) as Promise<{ results: Array<{ health: { status: string; reasons: string[] } | null }> }>;
 
       await harness.dispose();
       const result = await activeRequest;
@@ -1540,7 +1540,7 @@ describe("DeepSeek Harness plugin adapters", () => {
       expect(JSON.stringify(result)).not.toContain("Use the policy module.");
       expect(repository.getById(item.id)?.content).toBe("Use the policy module.");
     } finally {
-      repo.cleanup();
+      await scope.cleanup();
     }
   }, 20_000);
 
@@ -1655,10 +1655,10 @@ describe("DeepSeek Harness plugin adapters", () => {
     checkHealth.mockRestore();
   });
 
-  it("knowledge_get reports current and changed Git-backed evidence on request", async () => {
-    const repo = createTemporaryGitRepository("dsh-knowledge-harness-get-health-");
+  it("knowledge_get reports current and changed Git-backed evidence on request", async ({ gitScope: scope }) => {
+    const repo = scope.repository("dsh-knowledge-harness-get-health-");
     try {
-      await initializeGitRepository(repo.directory);
+      await scope.initialize(repo.directory);
       repo.write("src/policy.ts", "initial policy\n");
       const commit = await repo.commit("initial policy");
       const harness = createPluginHarness({ project: "payments" });
@@ -1677,15 +1677,15 @@ describe("DeepSeek Harness plugin adapters", () => {
       const session = makeSession(repo.directory);
       const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch");
 
-      const current = await harness.invoke("knowledge_get", {
+      const current = await scope.track(() => harness.invoke("knowledge_get", {
         id: item.id,
         includeHealth: true,
-      }, session) as { item: { status: string; creationOrigin: string }; health: { status: string } | null };
+      }, session)) as { item: { status: string; creationOrigin: string }; health: { status: string } | null };
       repo.write("src/policy.ts", "changed policy\n");
-      const stale = await harness.invoke("knowledge_get", {
+      const stale = await scope.track(() => harness.invoke("knowledge_get", {
         id: item.id,
         includeHealth: true,
-      }, session) as { item: { status: string; creationOrigin: string }; health: { status: string } | null };
+      }, session)) as { item: { status: string; creationOrigin: string }; health: { status: string } | null };
 
       expect(current.health?.status).toBe("current");
       expect(stale.health?.status).toBe("potentially_stale");
@@ -1695,7 +1695,7 @@ describe("DeepSeek Harness plugin adapters", () => {
       expect(checkHealth).toHaveBeenCalledTimes(2);
       checkHealth.mockRestore();
     } finally {
-      repo.cleanup();
+      await scope.cleanup();
     }
   }, 20_000);
 
@@ -1779,10 +1779,10 @@ describe("DeepSeek Harness plugin adapters", () => {
     checkHealth.mockRestore();
   });
 
-  it("knowledge_get never uses an explicit workspace override for health Git scope", async () => {
-    const repo = createTemporaryGitRepository("dsh-knowledge-get-workspace-override-");
+  it("knowledge_get never uses an explicit workspace override for health Git scope", async ({ gitScope: scope }) => {
+    const repo = scope.repository("dsh-knowledge-get-workspace-override-");
     try {
-      await initializeGitRepository(repo.directory);
+      await scope.initialize(repo.directory);
       repo.write("src/policy.ts", "outside policy\n");
       const commit = await repo.commit("outside policy");
       const harness = createPluginHarness({ project: "payments" });
@@ -1800,18 +1800,18 @@ describe("DeepSeek Harness plugin adapters", () => {
       });
       const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch");
 
-      const result = await harness.invoke("knowledge_get", {
+      const result = await scope.track(() => harness.invoke("knowledge_get", {
         id: item.id,
         workspace: repo.directory,
         includeHealth: true,
-      }, makeSession("C:\\workspace\\payments")) as { item: { id: string }; health: unknown };
+      }, makeSession("C:\\workspace\\payments"))) as { item: { id: string }; health: unknown };
 
       expect(result.item.id).toBe(item.id);
       expect(result.health).toBeNull();
       expect(checkHealth).not.toHaveBeenCalled();
       checkHealth.mockRestore();
     } finally {
-      repo.cleanup();
+      await scope.cleanup();
     }
   }, 20_000);
 
@@ -1845,10 +1845,10 @@ describe("DeepSeek Harness plugin adapters", () => {
     expect(result.health.evidence).toHaveLength(16);
   });
 
-  it("knowledge_get health output adds no Git paths, commits, diffs, source contents, or raw errors", async () => {
-    const repo = createTemporaryGitRepository("dsh-knowledge-get-health-privacy-");
+  it("knowledge_get health output adds no Git paths, commits, diffs, source contents, or raw errors", async ({ gitScope: scope }) => {
+    const repo = scope.repository("dsh-knowledge-get-health-privacy-");
     try {
-      await initializeGitRepository(repo.directory);
+      await scope.initialize(repo.directory);
       repo.write("src/private-policy.ts", "private source contents\n");
       const commit = await repo.commit("policy");
       const harness = createPluginHarness({ project: "payments" });
@@ -1865,11 +1865,11 @@ describe("DeepSeek Harness plugin adapters", () => {
         }],
       });
 
-      const ordinary = await harness.invoke("knowledge_get", { id: item.id }, makeSession(repo.directory)) as { item: unknown };
-      const optedIn = await harness.invoke("knowledge_get", {
+      const ordinary = await scope.track(() => harness.invoke("knowledge_get", { id: item.id }, makeSession(repo.directory))) as { item: unknown };
+      const optedIn = await scope.track(() => harness.invoke("knowledge_get", {
         id: item.id,
         includeHealth: true,
-      }, makeSession(repo.directory)) as { item: unknown; health: unknown };
+      }, makeSession(repo.directory))) as { item: unknown; health: unknown };
       const healthJson = JSON.stringify(optedIn.health);
 
       expect(optedIn.item).toEqual(ordinary.item);
@@ -1881,7 +1881,7 @@ describe("DeepSeek Harness plugin adapters", () => {
       expect(healthJson).not.toContain(repo.directory);
       expect(healthJson).not.toMatch(/spawn|permission denied|fatal:/i);
     } finally {
-      repo.cleanup();
+      await scope.cleanup();
     }
   }, 20_000);
 
@@ -1917,10 +1917,10 @@ describe("DeepSeek Harness plugin adapters", () => {
     expect(getWhileHealth.health).toMatchObject({ status: "unverifiable", reasons: ["health_check_busy"] });
   });
 
-  it("disposal cancels and awaits an active opted-in get health check", async () => {
-    const repo = createTemporaryGitRepository("dsh-knowledge-get-health-dispose-");
+  it("disposal cancels and awaits an active opted-in get health check", async ({ gitScope: scope }) => {
+    const repo = scope.repository("dsh-knowledge-get-health-dispose-");
     try {
-      await initializeGitRepository(repo.directory);
+      await scope.initialize(repo.directory);
       repo.write("src/policy.ts", "policy\n");
       const commit = await repo.commit("policy");
       const harness = createPluginHarness({ project: "payments" });
@@ -1936,10 +1936,10 @@ describe("DeepSeek Harness plugin adapters", () => {
           gitProvenance: { commit, path: "src/policy.ts" },
         }],
       });
-      const activeRequest = harness.invoke("knowledge_get", {
+      const activeRequest = scope.track(() => harness.invoke("knowledge_get", {
         id: item.id,
         includeHealth: true,
-      }, makeSession(repo.directory)) as Promise<{ health: { status: string; reasons: string[] } | null }>;
+      }, makeSession(repo.directory))) as Promise<{ health: { status: string; reasons: string[] } | null }>;
 
       await harness.dispose();
       const result = await activeRequest;
@@ -1948,7 +1948,7 @@ describe("DeepSeek Harness plugin adapters", () => {
       expect(result.health?.reasons).toContain("cancelled");
       expect(repository.getById(item.id)?.content).toBe(item.content);
     } finally {
-      repo.cleanup();
+      await scope.cleanup();
     }
   }, 20_000);
 
@@ -2461,22 +2461,22 @@ describe("opt-in knowledge health guidance", () => {
     }
   });
 
-  it.each(["current", "changed", "missing", "unindexed"] as const)(
-    "adds safe guidance for a real %s source without extra Git work", async (state) => {
-      const { repo, harness, repository, item, session } = await createGuidanceFixture();
+  it.for(["current", "changed", "missing", "unindexed"] as const)(
+    "adds safe guidance for a real %s source without extra Git work", { timeout: 20_000 }, async (state, { gitScope: scope }) => {
+      const { repo, harness, repository, item, session } = await createGuidanceFixture(scope);
       try {
         if (state === "changed") repo.write("src/private-policy.ts", "changed private source\n");
         if (state === "missing") unlinkSync(join(repo.directory, "src", "private-policy.ts"));
         if (state === "unindexed") await repo.git(["rm", "--cached", "--", "src/private-policy.ts"]);
         const actualHealth = healthApi.checkKnowledgeHealthBatch;
-        const runner: GitCommandRunner = { run: vi.fn(async (cwd, args) => ({ exitCode: 0, stdout: await runGit(cwd, args) })) };
+        const runner: GitCommandRunner = { run: vi.fn(async (cwd, args) => ({ exitCode: 0, stdout: await scope.git(cwd, args) })) };
         const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch")
           .mockImplementation((items, options) => actualHealth(items, { ...options, runner }));
-        const ordinary = await harness.invoke("knowledge_health", { ids: [item.id] }, session) as ToolHealthResult;
+        const ordinary = await scope.track(() => harness.invoke("knowledge_health", { ids: [item.id] }, session)) as ToolHealthResult;
         const gitCalls = vi.mocked(runner.run).mock.calls.length;
         expect(gitCalls).toBeGreaterThan(0);
         vi.mocked(runner.run).mockClear();
-        const guided = await harness.invoke("knowledge_health", { ids: [item.id], includeGuidance: true }, session) as ToolHealthResult;
+        const guided = await scope.track(() => harness.invoke("knowledge_health", { ids: [item.id], includeGuidance: true }, session)) as ToolHealthResult;
         const result = guided.results[0]!;
 
         expect(checkHealth).toHaveBeenCalledTimes(2);
@@ -2495,13 +2495,13 @@ describe("opt-in knowledge health guidance", () => {
         expect(json).not.toMatch(/diff --git|fatal:|spawn|permission denied/i);
         expect(JSON.stringify(result.guidance)).not.toMatch(/edited|deleted|renamed/i);
       } finally {
-        repo.cleanup();
+        await scope.cleanup();
       }
-    }, 20_000,
+    },
   );
 
-  it("keeps unavailable Git unverifiable and does not disclose process output", async () => {
-    const { repo, harness, item, session } = await createGuidanceFixture();
+  it("keeps unavailable Git unverifiable and does not disclose process output", async ({ gitScope: scope }) => {
+    const { repo, harness, item, session } = await createGuidanceFixture(scope);
     try {
       const actualHealth = healthApi.checkKnowledgeHealthBatch;
       const runner: GitCommandRunner = { run: vi.fn(async () => ({
@@ -2509,7 +2509,7 @@ describe("opt-in knowledge health guidance", () => {
       })) };
       const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch")
         .mockImplementation((items, options) => actualHealth(items, { ...options, runner }));
-      const result = await harness.invoke("knowledge_health", { ids: [item.id], includeGuidance: true }, session) as ToolHealthResult;
+      const result = await scope.track(() => harness.invoke("knowledge_health", { ids: [item.id], includeGuidance: true }, session)) as ToolHealthResult;
       expect(result.results[0]).toMatchObject({
         health: { status: "unverifiable", reasons: ["git_unavailable"] },
         guidance: [{ code: "check_environment" }],
@@ -2518,7 +2518,7 @@ describe("opt-in knowledge health guidance", () => {
       expect(runner.run).toHaveBeenCalledOnce();
       expect(JSON.stringify(result)).not.toMatch(/fatal:|private|password=secret|source\.ts/);
     } finally {
-      repo.cleanup();
+      await scope.cleanup();
     }
   }, 20_000);
 
@@ -2588,8 +2588,8 @@ describe("opt-in knowledge health guidance", () => {
     );
   });
 
-  it("preserves stale-overflow precedence without traversing 50k evidence for guidance", async () => {
-    const { repo, harness, repository, item, session } = await createGuidanceFixture();
+  it("preserves stale-overflow precedence without traversing 50k evidence for guidance", async ({ gitScope: scope }) => {
+    const { repo, harness, repository, item, session } = await createGuidanceFixture(scope);
     try {
       repo.write("src/private-policy.ts", "changed source\n");
       const evidence = new Proxy([
@@ -2611,7 +2611,7 @@ describe("opt-in knowledge health guidance", () => {
       });
       vi.spyOn(KnowledgeRepository.prototype, "getById").mockReturnValue({ ...item, evidence });
       const guidance = vi.spyOn(guidanceApi, "createHealthGuidance");
-      const result = await harness.invoke("knowledge_health", { ids: [item.id], includeGuidance: true }, session) as ToolHealthResult;
+      const result = await scope.track(() => harness.invoke("knowledge_health", { ids: [item.id], includeGuidance: true }, session)) as ToolHealthResult;
       expect(result.results[0]!.health).toMatchObject({
         status: "potentially_stale", reasons: ["working_tree_changed", "evidence_overflow"],
         evidenceCount: 50_000, overflowCount: 49_984, evidenceTruncated: true,
@@ -2622,7 +2622,7 @@ describe("opt-in knowledge health guidance", () => {
         status: "potentially_stale", reasons: ["working_tree_changed", "evidence_overflow"],
       });
     } finally {
-      repo.cleanup();
+      await scope.cleanup();
     }
   }, 20_000);
 
@@ -2728,8 +2728,8 @@ describe("opt-in knowledge health guidance", () => {
     expect(ownedStore!.database.open).toBe(false);
   });
 
-  it("leaves actual M2 ranking, scope, duplicates and pre-step retrieval unchanged", async () => {
-    const { repo, harness, repository, item, session } = await createGuidanceFixture();
+  it("leaves actual M2 ranking, scope, duplicates and pre-step retrieval unchanged", async ({ gitScope: scope }) => {
+    const { repo, harness, repository, item, session } = await createGuidanceFixture(scope);
     try {
       repo.write("src/private-policy.ts", "changed source\n");
       const projectVerified = repository.create({ type: "fact", content: "ResponseRouter guidance for provider routing.", scope: item.scope });
@@ -2746,7 +2746,7 @@ describe("opt-in knowledge health guidance", () => {
       const beforeContext = await runPreStep(harness, makeSession(repo.directory), "ResponseRouter guidance");
       const checkHealth = vi.spyOn(healthApi, "checkKnowledgeHealthBatch");
       const guidance = vi.spyOn(guidanceApi, "createHealthGuidance");
-      const result = await harness.invoke("knowledge_health", { ids: [item.id, automatic.id], includeGuidance: true }, session) as ToolHealthResult;
+      const result = await scope.track(() => harness.invoke("knowledge_health", { ids: [item.id, automatic.id], includeGuidance: true }, session)) as ToolHealthResult;
       expect(result.results[0]!.health!.status).toBe("potentially_stale");
       expect(retrieve()).toEqual(before);
       expect(repository.list()).toEqual(beforeStored);
@@ -2765,13 +2765,13 @@ describe("opt-in knowledge health guidance", () => {
       expect(afterContext.messages.at(-1)!.source).toEqual(beforeContext.messages.at(-1)!.source);
       expect(afterContext.messages.at(-1)!.content).toEqual(beforeContext.messages.at(-1)!.content);
       for (const args of [{ id: item.id }, { id: item.id, includeHealth: false }]) {
-        expect(await harness.invoke("knowledge_get", args, session)).not.toHaveProperty("health");
+        expect(await scope.track(() => harness.invoke("knowledge_get", args, session))).not.toHaveProperty("health");
       }
-      expect(await harness.invoke("knowledge_search", { query: "ResponseRouter guidance" }, session)).not.toHaveProperty("health");
+      expect(await scope.track(() => harness.invoke("knowledge_search", { query: "ResponseRouter guidance" }, session))).not.toHaveProperty("health");
       expect(checkHealth).not.toHaveBeenCalled();
       expect(guidance).not.toHaveBeenCalled();
     } finally {
-      repo.cleanup();
+      await scope.cleanup();
     }
   }, 20_000);
 });
@@ -2791,9 +2791,9 @@ type ToolHealthResult = {
   }>;
 };
 
-async function createGuidanceFixture() {
-  const repo = createTemporaryGitRepository("dsh-knowledge-guidance-");
-  await initializeGitRepository(repo.directory);
+async function createGuidanceFixture(scope: GitTestScope) {
+  const repo = scope.repository("dsh-knowledge-guidance-");
+  await scope.initialize(repo.directory);
   repo.write("src/private-policy.ts", "private source contents\n");
   const commit = await repo.commit("policy");
   const harness = createPluginHarness({ project: "payments" });
