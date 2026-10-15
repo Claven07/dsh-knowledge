@@ -1,15 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect } from "vitest";
 import {
   KnowledgeRepository,
   KnowledgeStore,
-  checkKnowledgeHealth,
   MAX_RETRIEVAL_RESULTS,
   RETRIEVAL_SCORING,
   retrieveRelevantKnowledge,
   type CreateKnowledgeInput,
   type Knowledge,
 } from "../src/index.js";
-import { createTemporaryGitRepository, initializeGitRepository } from "./git-fixtures.js";
+import { gitTest as it } from "./git-fixtures.js";
 
 const timestamp = "2026-10-01T10:00:00.000Z";
 
@@ -182,10 +181,10 @@ describe("deterministic knowledge retrieval", () => {
     expect(retrieve("ResponseRouter fallback guidance")).toEqual([]);
   });
 
-  it("does not change M2 eligibility when Git-backed knowledge may be stale", async () => {
-    const gitRepository = createTemporaryGitRepository("dsh-knowledge-retrieval-health-");
+  it("does not change M2 eligibility when Git-backed knowledge may be stale", async ({ gitScope: scope }) => {
+    const gitRepository = scope.repository("dsh-knowledge-retrieval-health-");
     try {
-      await initializeGitRepository(gitRepository.directory);
+      await scope.initialize(gitRepository.directory);
       gitRepository.write("src/policy.ts", "original policy\n");
       const commit = await gitRepository.commit("initial policy");
       gitRepository.write("src/policy.ts", "changed policy\n");
@@ -202,7 +201,7 @@ describe("deterministic knowledge retrieval", () => {
         id: knowledge.id,
         score,
       }));
-      const health = await checkKnowledgeHealth(item, {
+      const health = await scope.health(item, {
         workspaceDirectory: gitRepository.directory,
       });
       const after = retrieve("ResponseRouter policy authorization").map(({ knowledge, score }) => ({
@@ -214,7 +213,7 @@ describe("deterministic knowledge retrieval", () => {
       expect(after).toEqual(before);
       expect(after.map(({ id }) => id)).toContain(item.id);
     } finally {
-      gitRepository.cleanup();
+      await scope.cleanup();
     }
   }, 20_000);
 
